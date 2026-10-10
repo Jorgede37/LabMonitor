@@ -1,0 +1,65 @@
+**/venv/
+**/__pycache__/
+**/.env
+*.pyc
+**/data/*.db
+**/data/*.db-wal
+**/data/*.db-shm
+
+# Variables de entorno y credenciales
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Bases de datos locales
+*.db
+*.sqlite
+*.sqlite3
+
+# React / Node
+node_modules/
+dist/
+build/
+
+# Archivos del sistema
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Credenciales
+.env
+.env.*
+!.env.example
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# React
+node_modules/
+dist/
+build/
+
+# Bases de datos locales y respaldos
+*.db
+*.sqlite
+*.sqlite3
+*.bak
+*.bacpac
+*.mdf
+*.ldf
+
+# Archivos temporales
+*.log
+Thumbs.db
