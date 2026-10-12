@@ -11,13 +11,12 @@ import win32pipe
 import win32security
 import pywintypes
 
-from local_database import obtener_sesion_local_activa
-
 from session_manager import (
     iniciar_sesion_estudiante,
     consultar_sesion_estudiante,
     cerrar_sesion_estudiante,
     recuperar_cierres_pendientes,
+    sincronizar_sesion_servidor,
     SessionManagerError,
 )
 
@@ -28,7 +27,6 @@ from session_manager import (
 
 PIPE_NAME = r"\\.\pipe\LabMonitorStudent"
 BUFFER_SIZE = 65536
-
 RECOVERY_INTERVAL = 30
 
 session_lock = threading.RLock()
@@ -101,7 +99,6 @@ def crear_atributos_seguridad():
 def ejecutar_recuperacion():
 
     try:
-
         with session_lock:
             resumen = recuperar_cierres_pendientes()
 
@@ -123,18 +120,14 @@ def ejecutar_recuperacion():
         )
 
         if errores:
-
             for error in errores:
-
                 print(
                     "[RECUPERACION] Pendiente:",
                     error["session_id"],
                     "-",
                     error["error"]
                 )
-
         else:
-
             print(
                 "[RECUPERACION] "
                 "Sincronizacion completada."
@@ -143,7 +136,6 @@ def ejecutar_recuperacion():
         print()
 
     except Exception as error:
-
         print(
             "[RECUPERACION] Error inesperado:",
             type(error).__name__,
@@ -153,9 +145,7 @@ def ejecutar_recuperacion():
 
 def ciclo_recuperacion():
 
-    print(
-        "[RECUPERACION] Servicio iniciado."
-    )
+    print("[RECUPERACION] Servicio iniciado.")
 
     while not stop_event.is_set():
 
@@ -164,55 +154,7 @@ def ciclo_recuperacion():
         if stop_event.wait(RECOVERY_INTERVAL):
             break
 
-    print(
-        "[RECUPERACION] Servicio detenido."
-    )
-
-
-# ==========================================
-# CONSULTAR ESTADO LOCAL
-# ==========================================
-
-def consultar_estado_local(session_id):
-    """
-    Consulta de solo lectura para Tkinter.
-
-    No cierra sesiones ni modifica SQLite.
-
-    NOTA:
-    Esta version se utiliza solamente en
-    nuestro entorno de desarrollo.
-    """
-
-    if (
-        not isinstance(session_id, int)
-        or isinstance(session_id, bool)
-        or session_id <= 0
-    ):
-        raise SessionManagerError(
-            "ID de sesion invalido."
-        )
-
-    sesion = obtener_sesion_local_activa()
-
-    if sesion is None:
-
-        return {
-            "session_id": session_id,
-            "status": "not_active"
-        }
-
-    if sesion["server_session_id"] != session_id:
-
-        return {
-            "session_id": session_id,
-            "status": "different_session"
-        }
-
-    return {
-        "session_id": session_id,
-        "status": sesion["status"]
-    }
+    print("[RECUPERACION] Servicio detenido.")
 
 
 # ==========================================
@@ -222,37 +164,27 @@ def consultar_estado_local(session_id):
 def procesar_solicitud(solicitud):
 
     if not isinstance(solicitud, dict):
-
         return {
             "ok": False,
-            "error": (
-                "La solicitud debe ser "
-                "un objeto JSON."
-            )
+            "error": "La solicitud debe ser un objeto JSON."
         }
 
     accion = solicitud.get("action")
     student_token = solicitud.get("student_token")
 
     if not isinstance(student_token, str):
-
         return {
             "ok": False,
             "error": "Falta el token del estudiante."
         }
 
     if not student_token.strip():
-
         return {
             "ok": False,
-            "error": (
-                "El token del estudiante "
-                "esta vacio."
-            )
+            "error": "El token del estudiante esta vacio."
         }
 
     try:
-
         with session_lock:
 
             if accion == "start":
@@ -275,16 +207,15 @@ def procesar_solicitud(solicitud):
 
             elif accion == "status":
 
-                session_id = solicitud.get(
-                    "session_id"
-                )
+                session_id = solicitud.get("session_id")
 
-                resultado = consultar_estado_local(
+                # Consulta SQL Server y, si la sesion
+                # termino, sincroniza SQLite.
+                resultado = sincronizar_sesion_servidor(
                     session_id
                 )
 
             else:
-
                 return {
                     "ok": False,
                     "error": "Operacion no permitida."
@@ -296,14 +227,12 @@ def procesar_solicitud(solicitud):
         }
 
     except SessionManagerError as error:
-
         return {
             "ok": False,
             "error": str(error)
         }
 
     except Exception as error:
-
         print(
             "[ERROR] Fallo interno:",
             type(error).__name__,
@@ -327,11 +256,7 @@ def enviar_respuesta(pipe, respuesta):
         ensure_ascii=False
     ).encode("utf-8")
 
-    win32file.WriteFile(
-        pipe,
-        contenido
-    )
-
+    win32file.WriteFile(pipe, contenido)
     win32file.FlushFileBuffers(pipe)
 
 
@@ -342,7 +267,6 @@ def enviar_respuesta(pipe, respuesta):
 def atender_cliente(pipe):
 
     try:
-
         _, contenido = win32file.ReadFile(
             pipe,
             BUFFER_SIZE
@@ -352,36 +276,25 @@ def atender_cliente(pipe):
             contenido.decode("utf-8")
         )
 
-        respuesta = procesar_solicitud(
-            solicitud
-        )
+        respuesta = procesar_solicitud(solicitud)
 
     except (
         json.JSONDecodeError,
         UnicodeDecodeError
     ):
-
         respuesta = {
             "ok": False,
-            "error": (
-                "La solicitud contiene "
-                "JSON invalido."
-            )
+            "error": "La solicitud contiene JSON invalido."
         }
 
     except pywintypes.error as error:
-
         print(
             "[ERROR] Comunicacion local:",
             error.winerror
         )
-
         return
 
-    enviar_respuesta(
-        pipe,
-        respuesta
-    )
+    enviar_respuesta(pipe, respuesta)
 
 
 # ==========================================
@@ -420,7 +333,6 @@ def iniciar_puente():
         pipe = None
 
         try:
-
             pipe = win32pipe.CreateNamedPipe(
                 PIPE_NAME,
                 win32pipe.PIPE_ACCESS_DUPLEX,
@@ -438,21 +350,18 @@ def iniciar_puente():
             )
 
             try:
-
                 win32pipe.ConnectNamedPipe(
                     pipe,
                     None
                 )
 
             except pywintypes.error as error:
-
                 if error.winerror != 535:
                     raise
 
             atender_cliente(pipe)
 
         except pywintypes.error as error:
-
             print(
                 "[ERROR] Named Pipe:",
                 error.winerror,
@@ -460,7 +369,6 @@ def iniciar_puente():
             )
 
         except Exception as error:
-
             print(
                 "[ERROR] Puente local:",
                 type(error).__name__,
@@ -468,15 +376,10 @@ def iniciar_puente():
             )
 
         finally:
-
             if pipe is not None:
 
                 try:
-
-                    win32pipe.DisconnectNamedPipe(
-                        pipe
-                    )
-
+                    win32pipe.DisconnectNamedPipe(pipe)
                 except pywintypes.error:
                     pass
 
@@ -490,19 +393,14 @@ def iniciar_puente():
 if __name__ == "__main__":
 
     if os.name != "nt":
-
         sys.exit(
-            "LabMonitor Local Bridge "
-            "requiere Windows."
+            "LabMonitor Local Bridge requiere Windows."
         )
 
     try:
-
         iniciar_puente()
 
     except KeyboardInterrupt:
-
         stop_event.set()
-
         print()
         print("Puente local detenido.")

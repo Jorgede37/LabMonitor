@@ -1,6 +1,5 @@
 
 import os
-import time
 import msvcrt
 import sqlite3
 import threading
@@ -14,6 +13,7 @@ from local_database import conectar
 from sync_events import sincronizar_eventos
 from sync_hardware import sincronizar
 from logger import logger
+from heartbeat import iniciar_heartbeat
 
 
 # ==========================================
@@ -104,6 +104,7 @@ def iniciar_monitoreo(detener=None):
     bloqueo = obtener_bloqueo()
 
     if bloqueo is None:
+
         logger.error(
             "LabMonitor ya se encuentra ejecutándose"
         )
@@ -114,17 +115,41 @@ def iniciar_monitoreo(detener=None):
 
         return False
 
-    print("================================")
-    print("       LABMONITOR AGENT")
-    print("================================")
-    print("Monitoreo automático iniciado")
-    print(f"Intervalo: {INTERVALO} segundos")
-
-    logger.info(
-        "Monitoreo automático iniciado"
-    )
+    hilo_heartbeat = None
 
     try:
+
+        print("================================")
+        print("       LABMONITOR AGENT")
+        print("================================")
+        print("Monitoreo automático iniciado")
+        print(f"Intervalo de monitoreo: {INTERVALO} segundos")
+        print("Intervalo de heartbeat: 30 segundos")
+
+        logger.info(
+            "Monitoreo automático iniciado"
+        )
+
+        # ==================================
+        # INICIAR HEARTBEAT INDEPENDIENTE
+        # ==================================
+
+        hilo_heartbeat = threading.Thread(
+            target=iniciar_heartbeat,
+            args=(detener,),
+            daemon=True,
+            name="LabMonitor-Heartbeat"
+        )
+
+        hilo_heartbeat.start()
+
+        logger.info(
+            "Hilo de heartbeat iniciado"
+        )
+
+        # ==================================
+        # CICLO PRINCIPAL DE MONITOREO
+        # ==================================
 
         while not detener.is_set():
 
@@ -182,7 +207,7 @@ def iniciar_monitoreo(detener=None):
                 )
 
                 # ==================================
-                # 4. SINCRONIZAR INVENTARIO PRIMERO
+                # 4. SINCRONIZAR INVENTARIO
                 # ==================================
 
                 inventario_sincronizado = False
@@ -236,13 +261,11 @@ def iniciar_monitoreo(detener=None):
                 # no actualizamos el inventario remoto.
                 #
                 # Los eventos pendientes permanecen
-                # guardados en SQLite para un intento
-                # posterior.
+                # guardados en SQLite.
                 #
                 # Si el inventario remoto no pudo
                 # actualizarse, evitamos enviar eventos
-                # que podrían referirse a componentes
-                # todavía no registrados.
+                # de componentes aún no registrados.
 
                 if not inventario_sincronizado:
 
@@ -306,6 +329,33 @@ def iniciar_monitoreo(detener=None):
                 detener.wait(INTERVALO)
 
     finally:
+
+        # ==================================
+        # DETENER HEARTBEAT
+        # ==================================
+
+        detener.set()
+
+        if hilo_heartbeat is not None:
+
+            hilo_heartbeat.join(timeout=12)
+
+            if hilo_heartbeat.is_alive():
+
+                logger.warning(
+                    "El hilo de heartbeat no terminó "
+                    "dentro del tiempo esperado"
+                )
+
+            else:
+
+                logger.info(
+                    "Hilo de heartbeat detenido"
+                )
+
+        # ==================================
+        # LIBERAR BLOQUEO
+        # ==================================
 
         liberar_bloqueo(bloqueo)
 

@@ -3,7 +3,7 @@ from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
 # Configuración de SQL Server
-SERVER = r"localhost\MSSQLSERVER06"
+SERVER = r"localhost"
 DATABASE = "LabMonitor"
 
 # Conexión mediante autenticación de Windows
