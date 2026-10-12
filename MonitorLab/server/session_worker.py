@@ -1,5 +1,6 @@
 ﻿import logging
 import time
+import os
 
 from dotenv import load_dotenv
 from sqlalchemy import text
@@ -23,7 +24,11 @@ TIMEOUT_INACTIVIDAD = 300
 TIMEOUT_SIN_HEARTBEAT = 120
 
 # Solo computadora de pruebas
-COMPUTADORA_PRUEBA_ID = 2
+load_dotenv()
+
+COMPUTADORA_PRUEBA_ID = int(
+    os.getenv("COMPUTADORA_PRUEBA_ID", "2")
+)
 
 
 logging.basicConfig(
