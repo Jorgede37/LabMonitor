@@ -1,12 +1,16 @@
+import os
 
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import URL
 
-# Configuración de SQL Server
-SERVER = r"localhost\MSSQLSERVER06"
-DATABASE = "LabMonitor"
+load_dotenv()
 
-# Conexión mediante autenticación de Windows
+# Configuracion de SQL Server
+SERVER = os.getenv("SQL_SERVER", "localhost")
+DATABASE = os.getenv("SQL_DATABASE", "LabMonitor")
+
+# Conexion mediante autenticacion de Windows
 connection_url = URL.create(
     "mssql+pyodbc",
     query={
@@ -20,24 +24,3 @@ connection_url = URL.create(
 )
 
 engine = create_engine(connection_url)
-
-
-def probar_conexion():
-    try:
-        with engine.connect() as connection:
-            resultado = connection.execute(
-                text("SELECT DB_NAME() AS base_datos")
-            )
-
-            nombre_bd = resultado.scalar()
-
-            print("Conexión exitosa a SQL Server")
-            print(f"Base de datos: {nombre_bd}")
-
-    except Exception as error:
-        print("Error al conectar con SQL Server:")
-        print(error)
-
-
-if __name__ == "__main__":
-    probar_conexion()

@@ -1,4 +1,3 @@
-
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
@@ -8,7 +7,7 @@ from app.database import engine
 
 
 # ==========================================
-# CONFIGURACIÓN DEL ROUTER
+# CONFIGURACION DEL ROUTER
 # ==========================================
 
 router = APIRouter(
@@ -61,8 +60,15 @@ class InventarioHardware(BaseModel):
     complete: bool = False
 
 
+class HeartbeatRequest(BaseModel):
+    idle_seconds: int = Field(
+        ge=0,
+        le=4294967
+    )
+
+
 # ==========================================
-# SINCRONIZACIÓN DEL INVENTARIO
+# SINCRONIZACION DEL INVENTARIO
 # ==========================================
 
 @router.post("/hardware/sync")
@@ -80,8 +86,10 @@ def sincronizar_hardware(
 
     identificadores = set()
     presentes = set()
+
     cantidades = {
-        tipo: 0 for tipo in TIPOS_PERMITIDOS
+        tipo: 0
+        for tipo in TIPOS_PERMITIDOS
     }
 
     # ======================================
@@ -110,11 +118,9 @@ def sincronizar_hardware(
         identificadores.add(clave)
         presentes.add(clave)
 
-        cantidades[componente.component_type] += 1
-
-    # ======================================
-    # VALIDAR INVENTARIO COMPLETO
-    # ======================================
+        cantidades[
+            componente.component_type
+        ] += 1
 
     inventario_confiable = (
         inventario.complete
@@ -129,7 +135,7 @@ def sincronizar_hardware(
             status_code=400,
             detail=(
                 "Inventario incompleto o no confiable. "
-                "No se actualizará el estado del hardware."
+                "No se actualizara el estado del hardware."
             )
         )
 
@@ -154,7 +160,9 @@ def sincronizar_hardware(
                 FROM dbo.hardware_components
                 WHERE computer_id = :computer_id
             """),
-            {"computer_id": computer_id}
+            {
+                "computer_id": computer_id
+            }
         ).mappings().all()
 
         componentes_db = {
@@ -177,7 +185,9 @@ def sincronizar_hardware(
                 componente.hardware_identifier
             )
 
-            existente = componentes_db.get(clave)
+            existente = componentes_db.get(
+                clave
+            )
 
             parametros = {
                 "computer_id": computer_id,
@@ -192,7 +202,8 @@ def sincronizar_hardware(
                 connection.execute(
                     text("""
                         UPDATE dbo.hardware_components
-                        SET manufacturer = :manufacturer,
+                        SET
+                            manufacturer = :manufacturer,
                             model = :model,
                             serial_number = :serial_number,
                             status = 'active',
@@ -253,7 +264,9 @@ def sincronizar_hardware(
                     SET status = 'removed'
                     WHERE id = :component_id
                 """),
-                {"component_id": existente["id"]}
+                {
+                    "component_id": existente["id"]
+                }
             )
 
             desconectados += 1
@@ -261,11 +274,6 @@ def sincronizar_hardware(
         # ==================================
         # LIMPIAR CONTADORES ANTERIORES
         # ==================================
-
-        # La confirmación de desconexiones
-        # ahora ocurre localmente en SQLite.
-        # Ya no necesitamos contadores del
-        # servidor para esta computadora.
 
         connection.execute(
             text("""
@@ -276,7 +284,9 @@ def sincronizar_hardware(
                     WHERE computer_id = :computer_id
                 )
             """),
-            {"computer_id": computer_id}
+            {
+                "computer_id": computer_id
+            }
         )
 
     return {
@@ -290,4 +300,103 @@ def sincronizar_hardware(
         "total": len(inventario.components),
         "absence_check_enabled": False,
         "event_source": "local_agent"
+    }
+
+
+# ==========================================
+# HEARTBEAT Y ACTIVIDAD DEL ALUMNO
+# ==========================================
+
+@router.post("/heartbeat")
+def registrar_heartbeat(
+    datos: HeartbeatRequest,
+    agente: dict = Depends(autenticar_agente)
+):
+
+    computer_id = agente["computer_id"]
+
+    with engine.begin() as connection:
+
+        # Hora tomada del servidor SQL Server.
+        # No dependemos del reloj del agente.
+
+        resultado = connection.execute(
+            text("""
+                UPDATE dbo.computers
+                SET last_seen = SYSUTCDATETIME()
+                OUTPUT INSERTED.last_seen
+                WHERE id = :computer_id
+            """),
+            {
+                "computer_id": computer_id
+            }
+        ).scalar_one_or_none()
+
+        if resultado is None:
+            raise HTTPException(
+                status_code=404,
+                detail="Computadora no encontrada"
+            )
+
+        # La ultima actividad se calcula restando
+        # la inactividad al momento de recepcion.
+        #
+        # Nunca retrocedemos last_activity_at.
+        # Nunca colocamos actividad anterior
+        # al inicio de la sesion.
+
+        sesiones = connection.execute(
+            text("""
+                UPDATE dbo.sessions
+                SET last_activity_at =
+                    CASE
+                        WHEN last_activity_at IS NULL
+                             OR last_activity_at <
+                                CASE
+                                    WHEN DATEADD(
+                                        SECOND,
+                                        -:idle_seconds,
+                                        SYSUTCDATETIME()
+                                    ) < login_at
+                                    THEN login_at
+                                    ELSE DATEADD(
+                                        SECOND,
+                                        -:idle_seconds,
+                                        SYSUTCDATETIME()
+                                    )
+                                END
+                        THEN
+                            CASE
+                                WHEN DATEADD(
+                                    SECOND,
+                                    -:idle_seconds,
+                                    SYSUTCDATETIME()
+                                ) < login_at
+                                THEN login_at
+                                ELSE DATEADD(
+                                    SECOND,
+                                    -:idle_seconds,
+                                    SYSUTCDATETIME()
+                                )
+                            END
+                        ELSE last_activity_at
+                    END
+                OUTPUT
+                    INSERTED.id,
+                    INSERTED.last_activity_at
+                WHERE computer_id = :computer_id
+                  AND logout_at IS NULL
+            """),
+            {
+                "computer_id": computer_id,
+                "idle_seconds": datos.idle_seconds
+            }
+        ).mappings().all()
+
+    return {
+        "message": "Heartbeat registrado",
+        "computer_id": computer_id,
+        "last_seen": resultado.isoformat(),
+        "idle_seconds": datos.idle_seconds,
+        "active_sessions_updated": len(sesiones)
     }

@@ -16,7 +16,7 @@ from local_database import (
 
 
 # ==========================================
-# CONFIGURACIÓN
+# CONFIGURACION
 # ==========================================
 
 AGENT_DIR = Path(__file__).resolve().parent
@@ -32,11 +32,11 @@ AGENT_TOKEN = os.getenv("AGENT_TOKEN")
 
 
 class SessionManagerError(Exception):
-    """Error controlado de gestión de sesiones."""
+    """Error controlado de gestion de sesiones."""
 
 
 # ==========================================
-# COMUNICACIÓN CON FASTAPI
+# COMUNICACION CON FASTAPI
 # ==========================================
 
 def solicitar_servidor(
@@ -73,15 +73,16 @@ def solicitar_servidor(
 
     try:
         resultado = respuesta.json()
+
     except ValueError as error:
         raise SessionManagerError(
-            "El servidor devolvió una respuesta inválida."
+            "El servidor devolvio una respuesta invalida."
         ) from error
 
     if not respuesta.ok:
         detalle = resultado.get(
             "detail",
-            "La operación fue rechazada."
+            "La operacion fue rechazada."
         )
 
         raise SessionManagerError(
@@ -92,7 +93,7 @@ def solicitar_servidor(
 
 
 # ==========================================
-# CONSULTAR RECUPERACIÓN
+# CONSULTAR RECUPERACION
 # ==========================================
 
 def consultar_recuperacion(session_id):
@@ -126,10 +127,7 @@ def recuperar_cierres_pendientes():
         session_id = sesion["server_session_id"]
 
         try:
-
-            estado = consultar_recuperacion(
-                session_id
-            )
+            estado = consultar_recuperacion(session_id)
 
             if estado["active"]:
 
@@ -145,12 +143,11 @@ def recuperar_cierres_pendientes():
                 logout_at = resultado["logout_at"]
 
             else:
-
                 logout_at = estado["logout_at"]
 
             if not logout_at:
                 raise SessionManagerError(
-                    "No se recibió fecha de cierre."
+                    "No se recibio fecha de cierre."
                 )
 
             confirmar_cierre_local(
@@ -176,7 +173,7 @@ def recuperar_cierres_pendientes():
 
 
 # ==========================================
-# INICIAR SESIÓN
+# INICIAR SESION
 # ==========================================
 
 def iniciar_sesion_estudiante(student_token):
@@ -192,7 +189,7 @@ def iniciar_sesion_estudiante(student_token):
 
     if sesion_existente:
         raise SessionManagerError(
-            "Esta computadora ya tiene una sesión "
+            "Esta computadora ya tiene una sesion "
             "local activa o pendiente de cierre."
         )
 
@@ -203,7 +200,6 @@ def iniciar_sesion_estudiante(student_token):
     )
 
     try:
-
         guardar_sesion_local(
             server_session_id=resultado["session_id"],
             user_id=resultado["student"]["id"],
@@ -213,9 +209,8 @@ def iniciar_sesion_estudiante(student_token):
         )
 
     except Exception as error:
-
         raise SessionManagerError(
-            "SQL Server registró la sesión, "
+            "SQL Server registro la sesion, "
             "pero SQLite no pudo guardarla."
         ) from error
 
@@ -223,7 +218,7 @@ def iniciar_sesion_estudiante(student_token):
 
 
 # ==========================================
-# CONSULTAR SESIÓN DEL ESTUDIANTE
+# CONSULTAR SESION DEL ESTUDIANTE
 # ==========================================
 
 def consultar_sesion_estudiante(student_token):
@@ -249,8 +244,8 @@ def validar_identidad_local(student_token, sesion):
     Comprueba la identidad declarada en el JWT.
 
     IMPORTANTE:
-    Esta comprobación no valida la firma del
-    JWT. No debe utilizarse como autorización
+    Esta comprobacion no valida la firma del
+    JWT. No debe utilizarse como autorizacion
     definitiva para cerrar sesiones.
     """
 
@@ -277,7 +272,6 @@ def validar_identidad_local(student_token, sesion):
         TypeError,
         ValueError
     ) as error:
-
         raise SessionManagerError(
             "No fue posible identificar al estudiante."
         ) from error
@@ -285,12 +279,12 @@ def validar_identidad_local(student_token, sesion):
     if user_id != sesion["user_id"]:
         raise SessionManagerError(
             "El token no corresponde al estudiante "
-            "de la sesión local."
+            "de la sesion local."
         )
 
 
 # ==========================================
-# CERRAR SESIÓN
+# CERRAR SESION
 # ==========================================
 
 def cerrar_sesion_estudiante(student_token):
@@ -299,7 +293,7 @@ def cerrar_sesion_estudiante(student_token):
 
     if not sesion:
         raise SessionManagerError(
-            "No existe una sesión local activa."
+            "No existe una sesion local activa."
         )
 
     session_id = sesion["server_session_id"]
@@ -311,29 +305,22 @@ def cerrar_sesion_estudiante(student_token):
         if resumen["errores"]:
             raise SessionManagerError(
                 "El cierre sigue pendiente. "
-                "Se requiere conexión con el servidor."
+                "Se requiere conexion con el servidor."
             )
 
         return {
-            "message": "Sesión recuperada y finalizada",
+            "message": "Sesion recuperada y finalizada",
             "session_id": session_id
         }
 
-    # Verificamos que el token declara
-    # el mismo estudiante de la sesión.
     validar_identidad_local(
         student_token,
         sesion
     )
 
-    # Registramos primero la intención
-    # de cierre en SQLite.
-    marcar_cierre_pendiente(
-        session_id
-    )
+    marcar_cierre_pendiente(session_id)
 
     try:
-
         resultado = solicitar_servidor(
             metodo="POST",
             endpoint="/sessions/end",
@@ -352,27 +339,105 @@ def cerrar_sesion_estudiante(student_token):
 
     except SessionManagerError:
 
-        # Puede tratarse de una desconexión,
-        # una respuesta perdida o un JWT vencido.
-        # Consultamos el estado del servidor
-        # antes de intentar recuperar el cierre.
         resumen = recuperar_cierres_pendientes()
 
         if resumen["errores"]:
-
             raise SessionManagerError(
                 "No fue posible confirmar el cierre. "
-                "La sesión quedó pendiente en SQLite."
+                "La sesion quedo pendiente en SQLite."
             )
 
         return {
-            "message": "Sesión recuperada y finalizada",
+            "message": "Sesion recuperada y finalizada",
             "session_id": session_id
         }
 
 
 # ==========================================
-# PRUEBA DE CONFIGURACIÓN
+# SINCRONIZAR SESION CON SQL SERVER
+# ==========================================
+
+def sincronizar_sesion_servidor(session_id):
+    """
+    Comprueba si SQL Server sigue considerando
+    activa la sesion.
+
+    Si el servidor la cerro, actualiza SQLite.
+
+    Si no hay conexion, conserva el estado local.
+    """
+
+    if (
+        not isinstance(session_id, int)
+        or isinstance(session_id, bool)
+        or session_id <= 0
+    ):
+        raise SessionManagerError(
+            "ID de sesion invalido."
+        )
+
+    sesion = obtener_sesion_local_activa()
+
+    if sesion is None:
+        return {
+            "session_id": session_id,
+            "status": "not_active"
+        }
+
+    if sesion["server_session_id"] != session_id:
+        return {
+            "session_id": session_id,
+            "status": "different_session"
+        }
+
+    if sesion["status"] == "pending_close":
+        return {
+            "session_id": session_id,
+            "status": "pending_close"
+        }
+
+    try:
+        estado = consultar_recuperacion(session_id)
+
+    except SessionManagerError:
+        return {
+            "session_id": session_id,
+            "status": "unknown"
+        }
+
+    if estado.get("active") is True:
+        return {
+            "session_id": session_id,
+            "status": "active"
+        }
+
+    if estado.get("active") is not False:
+        return {
+            "session_id": session_id,
+            "status": "unknown"
+        }
+
+    logout_at = estado.get("logout_at")
+
+    if not logout_at:
+        return {
+            "session_id": session_id,
+            "status": "unknown"
+        }
+
+    confirmar_cierre_local(
+        server_session_id=session_id,
+        logout_at=logout_at
+    )
+
+    return {
+        "session_id": session_id,
+        "status": "not_active"
+    }
+
+
+# ==========================================
+# PRUEBA DE CONFIGURACION
 # ==========================================
 
 if __name__ == "__main__":
@@ -391,12 +456,12 @@ if __name__ == "__main__":
 
     if sesion:
         print(
-            "Sesión local:",
+            "Sesion local:",
             sesion["server_session_id"],
             sesion["status"]
         )
     else:
-        print("No existe una sesión local activa.")
+        print("No existe una sesion local activa.")
 
     pendientes = obtener_cierres_pendientes()
 

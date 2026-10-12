@@ -18,7 +18,6 @@ import pywintypes
 # ==========================================
 
 SERVER_URL = "http://127.0.0.1:8000"
-
 PIPE_NAME = r"\\.\pipe\LabMonitorStudent"
 
 COLOR_FONDO = "#0f172a"
@@ -56,7 +55,6 @@ def solicitar_agente(
         solicitud["session_id"] = session_id
 
     try:
-
         win32pipe.WaitNamedPipe(
             PIPE_NAME,
             5000
@@ -74,7 +72,6 @@ def solicitar_agente(
         )
 
     except pywintypes.error as error:
-
         raise ErrorAgente(
             "No fue posible conectar con el agente. "
             "Comprueba que local_bridge.py "
@@ -82,7 +79,6 @@ def solicitar_agente(
         ) from error
 
     try:
-
         win32pipe.SetNamedPipeHandleState(
             pipe,
             win32pipe.PIPE_READMODE_MESSAGE,
@@ -109,14 +105,11 @@ def solicitar_agente(
         )
 
         if not isinstance(respuesta, dict):
-
             raise ErrorAgente(
-                "El agente devolvio "
-                "una respuesta invalida."
+                "El agente devolvio una respuesta invalida."
             )
 
         if not respuesta.get("ok"):
-
             raise ErrorAgente(
                 str(
                     respuesta.get(
@@ -133,14 +126,12 @@ def solicitar_agente(
         json.JSONDecodeError,
         UnicodeDecodeError
     ) as error:
-
         raise ErrorAgente(
             "Se perdio la comunicacion con el agente. "
             "El estado de la sesion debe verificarse."
         ) from error
 
     finally:
-
         win32file.CloseHandle(pipe)
 
 
@@ -167,8 +158,8 @@ class LabMonitorClient:
         self.session_id = None
 
         self.operacion_en_curso = False
-
         self.cierre_pendiente = False
+
         self.verificacion_en_curso = False
         self.verificacion_programada = None
 
@@ -322,7 +313,6 @@ class LabMonitorClient:
         password = self.entrada_password.get()
 
         if not matricula or not password:
-
             self.estado.config(
                 text=(
                     "Introduce tu matricula "
@@ -330,7 +320,6 @@ class LabMonitorClient:
                 ),
                 fg=COLOR_ERROR
             )
-
             return
 
         self.operacion_en_curso = True
@@ -341,9 +330,7 @@ class LabMonitorClient:
         )
 
         self.estado.config(
-            text=(
-                "Autenticando y registrando sesion..."
-            ),
+            text="Autenticando y registrando sesion...",
             fg=COLOR_SECUNDARIO
         )
 
@@ -360,7 +347,6 @@ class LabMonitorClient:
     ):
 
         try:
-
             respuesta = requests.post(
                 f"{SERVER_URL}/auth/login",
                 json={
@@ -371,7 +357,6 @@ class LabMonitorClient:
             )
 
             if respuesta.status_code == 401:
-
                 raise ValueError(
                     "Matricula o contrasena incorrecta."
                 )
@@ -384,14 +369,12 @@ class LabMonitorClient:
             token = datos.get("access_token")
 
             if usuario.get("role") != "student":
-
                 raise ValueError(
                     "Esta aplicacion es exclusiva "
                     "para estudiantes."
                 )
 
             if not token:
-
                 raise ValueError(
                     "El servidor no devolvio "
                     "un token valido."
@@ -402,12 +385,9 @@ class LabMonitorClient:
                 token
             )
 
-            session_id = sesion.get(
-                "session_id"
-            )
+            session_id = sesion.get("session_id")
 
             if not session_id:
-
                 raise ValueError(
                     "El agente no devolvio "
                     "el ID de sesion."
@@ -423,7 +403,6 @@ class LabMonitorClient:
             )
 
         except requests.RequestException:
-
             self.root.after(
                 0,
                 lambda: self.mostrar_error(
@@ -482,6 +461,9 @@ class LabMonitorClient:
 
         self.mostrar_sesion()
 
+        # Comienza la comprobacion automatica.
+        self.programar_verificacion()
+
     def mostrar_sesion(self):
 
         self.limpiar()
@@ -490,7 +472,7 @@ class LabMonitorClient:
 
         tk.Label(
             tarjeta,
-            text="✓",
+            text="\u2713",
             font=("Segoe UI", 40),
             bg=COLOR_TARJETA,
             fg=COLOR_EXITO
@@ -529,9 +511,7 @@ class LabMonitorClient:
 
         tk.Label(
             tarjeta,
-            text=(
-                f"ID de sesion: {self.session_id}"
-            ),
+            text=f"ID de sesion: {self.session_id}",
             font=("Segoe UI", 10),
             bg=COLOR_TARJETA,
             fg=COLOR_SECUNDARIO
@@ -614,7 +594,6 @@ class LabMonitorClient:
     ):
 
         try:
-
             solicitar_agente(
                 "end",
                 token
@@ -634,7 +613,7 @@ class LabMonitorClient:
             self.root.after(
                 0,
                 lambda mensaje=mensaje:
-                self.error_logout(mensaje)
+                self.error_logout(session_id, mensaje)
             )
 
     def logout_exitoso_si_coincide(
@@ -647,7 +626,10 @@ class LabMonitorClient:
 
         self.logout_exitoso()
 
-    def error_logout(self, mensaje):
+    def error_logout(self, session_id, mensaje):
+
+        if self.session_id != session_id:
+            return
 
         self.operacion_en_curso = False
         self.cierre_pendiente = True
@@ -660,7 +642,7 @@ class LabMonitorClient:
         self.estado_sesion.config(
             text=(
                 "No se pudo confirmar el cierre.\n"
-                "Comprobando el estado local..."
+                "Comprobando el estado de la sesion..."
             ),
             fg=COLOR_ADVERTENCIA
         )
@@ -673,7 +655,9 @@ class LabMonitorClient:
 
     def programar_verificacion(self):
 
-        if not self.cierre_pendiente:
+        # Verificamos tanto sesiones activas como
+        # cierres pendientes de confirmacion.
+        if self.session_id is None:
             return
 
         if self.verificacion_programada is not None:
@@ -690,7 +674,7 @@ class LabMonitorClient:
 
         self.verificacion_programada = None
 
-        if not self.cierre_pendiente:
+        if self.session_id is None:
             return
 
         if self.verificacion_en_curso:
@@ -715,14 +699,13 @@ class LabMonitorClient:
     ):
 
         try:
-
             resultado = solicitar_agente(
                 "status",
                 token,
                 session_id=session_id
             )
 
-            estado = resultado.get("status")
+            estado = resultado.get("status", "unknown")
 
             self.root.after(
                 0,
@@ -733,10 +716,11 @@ class LabMonitorClient:
             )
 
         except ErrorAgente:
-
             self.root.after(
                 0,
-                self.reintentar_verificacion
+                lambda: self.reintentar_verificacion(
+                    session_id
+                )
             )
 
     def actualizar_estado_verificado(
@@ -745,25 +729,36 @@ class LabMonitorClient:
         estado
     ):
 
-        self.verificacion_en_curso = False
-
         if self.session_id != session_id:
             return
 
-        if not self.cierre_pendiente:
-            return
+        self.verificacion_en_curso = False
 
         if estado == "not_active":
 
-            # No existe una sesion activa local.
-            # En esta prueba controlada asumimos
-            # que el cierre ya fue recuperado.
-            self.cierre_pendiente = False
+            # El servidor confirmo que la sesion
+            # termino y SQLite fue sincronizada.
+            cierre_automatico = (
+                not self.cierre_pendiente
+                and not self.operacion_en_curso
+            )
 
             self.logout_exitoso()
+
+            if cierre_automatico:
+                messagebox.showinfo(
+                    "LabMonitor",
+                    "Tu sesion de laboratorio "
+                    "fue finalizada automaticamente.\n\n"
+                    "Puedes iniciar una nueva sesion "
+                    "cuando el servicio este disponible."
+                )
+
             return
 
         if estado == "pending_close":
+
+            self.cierre_pendiente = True
 
             self.boton_logout.config(
                 state="disabled",
@@ -773,71 +768,80 @@ class LabMonitorClient:
             self.estado_sesion.config(
                 text=(
                     "Salida registrada localmente.\n"
-                    "Esperando conexion con FastAPI..."
+                    "Esperando confirmacion del servidor..."
                 ),
                 fg=COLOR_ADVERTENCIA
             )
 
         elif estado == "active":
 
-            # El agente sigue considerando
-            # que la sesion esta activa.
-            self.cierre_pendiente = False
-            self.operacion_en_curso = False
+            if self.cierre_pendiente:
 
-            self.boton_logout.config(
-                state="normal",
-                text="Cerrar sesion"
-            )
+                # El cierre no se confirmo.
+                # Se permite volver a intentarlo.
+                self.cierre_pendiente = False
+                self.operacion_en_curso = False
 
-            self.estado_sesion.config(
-                text=(
-                    "La sesion sigue activa.\n"
-                    "Puedes intentar cerrarla nuevamente."
-                ),
-                fg=COLOR_ERROR
-            )
+                self.boton_logout.config(
+                    state="normal",
+                    text="Cerrar sesion"
+                )
 
-            return
+                self.estado_sesion.config(
+                    text=(
+                        "La sesion sigue activa.\n"
+                        "Puedes intentar cerrarla nuevamente."
+                    ),
+                    fg=COLOR_ADVERTENCIA
+                )
+
+            elif not self.operacion_en_curso:
+
+                self.estado_sesion.config(
+                    text="Sesion activa y verificada.",
+                    fg=COLOR_EXITO
+                )
 
         elif estado == "different_session":
 
             self.estado_sesion.config(
                 text=(
                     "Se detecto otra sesion local.\n"
-                    "Se requiere revisar el estado "
-                    "de LabMonitor."
+                    "Se requiere revisar LabMonitor."
                 ),
                 fg=COLOR_ERROR
             )
 
         else:
 
+            # 'unknown' incluye problemas de red.
+            # No se cierra la sesion por ello.
             self.estado_sesion.config(
                 text=(
-                    "No fue posible determinar "
-                    "el estado de la sesion."
-                ),
-                fg=COLOR_ERROR
-            )
-
-        self.programar_verificacion()
-
-    def reintentar_verificacion(self):
-
-        self.verificacion_en_curso = False
-
-        if self.cierre_pendiente:
-
-            self.estado_sesion.config(
-                text=(
-                    "Esperando comunicacion con "
-                    "el agente de LabMonitor..."
+                    "No fue posible comprobar el estado.\n"
+                    "Se intentara nuevamente."
                 ),
                 fg=COLOR_ADVERTENCIA
             )
 
-            self.programar_verificacion()
+        self.programar_verificacion()
+
+    def reintentar_verificacion(self, session_id):
+
+        if self.session_id != session_id:
+            return
+
+        self.verificacion_en_curso = False
+
+        self.estado_sesion.config(
+            text=(
+                "Esperando comunicacion con "
+                "el agente de LabMonitor..."
+            ),
+            fg=COLOR_ADVERTENCIA
+        )
+
+        self.programar_verificacion()
 
     # ======================================
     # CIERRE CONFIRMADO
@@ -875,7 +879,6 @@ class LabMonitorClient:
                 "LabMonitor",
                 "Espera a que termine la operacion."
             )
-
             return
 
         if self.cierre_pendiente:
@@ -885,7 +888,6 @@ class LabMonitorClient:
                 "La salida aun se esta sincronizando. "
                 "Espera a que termine."
             )
-
             return
 
         if self.session_id is not None:
@@ -895,7 +897,6 @@ class LabMonitorClient:
                 "Primero debes cerrar tu sesion "
                 "desde el boton de LabMonitor."
             )
-
             return
 
         self.root.destroy()
