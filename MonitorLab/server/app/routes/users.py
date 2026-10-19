@@ -8,6 +8,7 @@ from sqlalchemy.exc import IntegrityError
 
 from app.database import engine
 from app.security import generar_hash
+from app.email_verification import emitir_codigo_verificacion
 
 
 router = APIRouter(prefix="/users", tags=["Usuarios"])
@@ -72,7 +73,7 @@ def registrar_alumno(datos: RegistroAlumno):
                         student_id,
                         email
                     FROM dbo.users
-                    WHERE username = :matricula
+                    WHERE LOWER(username) = LOWER(:matricula)
                        OR student_id = :matricula
                        OR LOWER(email) = :email
                 """),
@@ -102,7 +103,8 @@ def registrar_alumno(datos: RegistroAlumno):
                         role,
                         full_name,
                         student_id,
-                        email
+                        email,
+                        email_verified
                     )
                     OUTPUT INSERTED.id
                     VALUES (
@@ -111,7 +113,8 @@ def registrar_alumno(datos: RegistroAlumno):
                         'student',
                         :full_name,
                         :student_id,
-                        :email
+                        :email,
+                        0
                     )
                 """),
                 {
@@ -125,8 +128,19 @@ def registrar_alumno(datos: RegistroAlumno):
 
             nuevo_id = resultado.scalar_one()
 
+            emitir_codigo_verificacion(
+                connection,
+                nuevo_id,
+                correo,
+                nombre
+            )
+
         return {
-            "message": "Alumno registrado correctamente",
+            "message": (
+                "Cuenta creada. Se envió un código de seguridad "
+                "al correo registrado; ingrésalo en LabMonitor "
+                "antes de iniciar sesión."
+            ),
             "user_id": nuevo_id,
             "username": matricula,
             "student_id": matricula,

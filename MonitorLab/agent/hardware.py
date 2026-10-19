@@ -3,6 +3,8 @@ import wmi
 
 
 TIPOS_HARDWARE = (
+    "cpu",
+    "motherboard",
     "ram",
     "gpu",
     "storage",
@@ -53,6 +55,92 @@ def obtener_inventario():
     componentes = []
     errores = []
     cantidades = {}
+    tipos_completos = []
+
+    # =====================================
+    # PROCESADORES
+    # =====================================
+    try:
+        procesadores = sistema.Win32_Processor()
+
+        for procesador in procesadores:
+            identificador = limpiar_texto(
+                procesador.ProcessorId
+            )
+
+            if (
+                not identificador
+                or identificador.lower() in (
+                    "unknown",
+                    "none",
+                    "00000000"
+                )
+            ):
+                identificador = limpiar_texto(
+                    procesador.DeviceID
+                )
+
+            componentes.append(
+                crear_componente(
+                    "cpu",
+                    procesador.Manufacturer,
+                    procesador.Name,
+                    identificador,
+                    f"CPU:{identificador}"
+                    if identificador
+                    else None
+                )
+            )
+
+        cantidades["cpu"] = len(procesadores)
+        tipos_completos.append("cpu")
+
+    except Exception as error:
+        errores.append(f"Procesador: {error}")
+
+    # =====================================
+    # TARJETA MADRE
+    # =====================================
+    try:
+        tarjetas = sistema.Win32_BaseBoard()
+
+        for indice, tarjeta in enumerate(tarjetas):
+            fabricante = limpiar_texto(tarjeta.Manufacturer)
+            modelo = limpiar_texto(tarjeta.Product)
+            numero_serie = limpiar_texto(tarjeta.SerialNumber)
+
+            if (
+                not numero_serie
+                or numero_serie.lower() in (
+                    "unknown",
+                    "none",
+                    "00000000",
+                    "to be filled by o.e.m.",
+                    "default string"
+                )
+            ):
+                identificador = (
+                    f"BOARD:{fabricante or 'unknown'}:"
+                    f"{modelo or indice}"
+                )
+            else:
+                identificador = f"BOARD:{numero_serie}"
+
+            componentes.append(
+                crear_componente(
+                    "motherboard",
+                    fabricante,
+                    modelo,
+                    numero_serie,
+                    identificador
+                )
+            )
+
+        cantidades["motherboard"] = len(tarjetas)
+        tipos_completos.append("motherboard")
+
+    except Exception as error:
+        errores.append(f"Tarjeta madre: {error}")
 
     # =====================================
     # MEMORIA RAM
@@ -62,7 +150,19 @@ def obtener_inventario():
 
         for ram in memorias:
             numero_serie = limpiar_texto(ram.SerialNumber)
-            capacidad = int(ram.Capacity)
+            capacidad_bytes = limpiar_texto(ram.Capacity)
+            try:
+                capacidad = (
+                    int(capacidad_bytes)
+                    if capacidad_bytes is not None
+                    else None
+                )
+            except ValueError:
+                capacidad = None
+                errores.append(
+                    "RAM: capacidad no válida; "
+                    "se conserva el componente sin capacidad."
+                )
 
             identificador = (
                 f"RAM:{numero_serie}"
@@ -77,13 +177,18 @@ def obtener_inventario():
                 crear_componente(
                     "ram",
                     ram.Manufacturer,
-                    f"{capacidad // (1024**3)} GB",
+                    (
+                        f"{capacidad // (1024**3)} GB"
+                        if capacidad is not None
+                        else None
+                    ),
                     numero_serie,
                     identificador
                 )
             )
 
         cantidades["ram"] = len(memorias)
+        tipos_completos.append("ram")
 
     except Exception as error:
         errores.append(f"RAM: {error}")
@@ -106,6 +211,7 @@ def obtener_inventario():
             )
 
         cantidades["gpu"] = len(graficas)
+        tipos_completos.append("gpu")
 
     except Exception as error:
         errores.append(f"GPU: {error}")
@@ -128,6 +234,7 @@ def obtener_inventario():
             )
 
         cantidades["storage"] = len(discos)
+        tipos_completos.append("storage")
 
     except Exception as error:
         errores.append(f"Almacenamiento: {error}")
@@ -150,6 +257,7 @@ def obtener_inventario():
             )
 
         cantidades["mouse"] = len(ratones)
+        tipos_completos.append("mouse")
 
     except Exception as error:
         errores.append(f"Mouse: {error}")
@@ -172,6 +280,7 @@ def obtener_inventario():
             )
 
         cantidades["keyboard"] = len(teclados)
+        tipos_completos.append("keyboard")
 
     except Exception as error:
         errores.append(f"Teclado: {error}")
@@ -199,6 +308,7 @@ def obtener_inventario():
             )
 
         cantidades["network"] = len(redes)
+        tipos_completos.append("network")
 
     except Exception as error:
         errores.append(f"Red: {error}")
@@ -218,6 +328,8 @@ def obtener_inventario():
             errores.append(
                 f"No se detectaron componentes: {tipo}"
             )
+            if tipo in tipos_completos:
+                tipos_completos.remove(tipo)
 
     identificadores = set()
 
@@ -231,14 +343,20 @@ def obtener_inventario():
             errores.append(
                 f"Identificador duplicado: {clave}"
             )
+            if clave[0] in tipos_completos:
+                tipos_completos.remove(clave[0])
 
         identificadores.add(clave)
 
-    completo = len(errores) == 0
+    completo = (
+        len(errores) == 0
+        and len(tipos_completos) == len(TIPOS_HARDWARE)
+    )
 
     return {
         "components": componentes,
         "complete": completo,
+        "complete_types": tipos_completos,
         "errors": errores,
         "counts": cantidades
     }

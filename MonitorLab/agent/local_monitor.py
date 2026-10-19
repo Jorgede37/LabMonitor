@@ -56,7 +56,17 @@ def comparar_inventario(inventario=None):
     if inventario is None:
         inventario = obtener_inventario()
 
-    if not inventario["complete"]:
+    tipos_completos = set(
+        inventario.get("complete_types", [])
+    )
+
+    if not tipos_completos and inventario.get("complete"):
+        tipos_completos = {
+            componente["component_type"]
+            for componente in inventario["components"]
+        }
+
+    if not tipos_completos:
         print("ERROR: Inventario WMI incompleto.")
 
         for error in inventario["errors"]:
@@ -64,7 +74,11 @@ def comparar_inventario(inventario=None):
 
         return False
 
-    componentes = inventario["components"]
+    componentes = [
+        componente
+        for componente in inventario["components"]
+        if componente["component_type"] in tipos_completos
+    ]
 
     inicializar_base()
     inicializar_inventario_local()
@@ -86,6 +100,53 @@ def comparar_inventario(inventario=None):
     with conectar() as conexion:
 
         conexion.execute("BEGIN IMMEDIATE")
+
+        tipos_base = {
+            fila["component_type"]
+            for fila in conexion.execute("""
+                SELECT component_type
+                FROM hardware_baseline_types
+            """).fetchall()
+        }
+
+        for tipo in tipos_completos - tipos_base:
+            for componente in componentes:
+                if componente["component_type"] != tipo:
+                    continue
+
+                conexion.execute("""
+                    INSERT INTO local_hardware (
+                        component_type,
+                        hardware_identifier,
+                        manufacturer,
+                        model,
+                        serial_number,
+                        status,
+                        missing_count,
+                        first_seen,
+                        last_seen
+                    )
+                    VALUES (
+                        ?, ?, ?, ?, ?,
+                        'active', 0, ?, ?
+                    )
+                """, (
+                    componente["component_type"],
+                    componente["hardware_identifier"],
+                    componente.get("manufacturer"),
+                    componente.get("model"),
+                    componente.get("serial_number"),
+                    fecha,
+                    fecha
+                ))
+
+            conexion.execute("""
+                INSERT INTO hardware_baseline_types (
+                    component_type,
+                    established_at
+                )
+                VALUES (?, ?)
+            """, (tipo, fecha))
 
         anteriores = conexion.execute("""
             SELECT *
@@ -160,6 +221,42 @@ def comparar_inventario(inventario=None):
 
                     reconectados += 1
 
+                cambios = []
+                for campo in (
+                    "manufacturer",
+                    "model",
+                    "serial_number"
+                ):
+                    valor_anterior = anterior.get(campo)
+                    valor_nuevo = componente.get(campo)
+
+                    if valor_anterior != valor_nuevo:
+                        cambios.append(
+                            (
+                                campo,
+                                valor_anterior,
+                                valor_nuevo
+                            )
+                        )
+
+                if cambios:
+                    anterior_texto = "; ".join(
+                        f"{campo}={valor or 'N/D'}"
+                        for campo, valor, _ in cambios
+                    )[:255]
+                    nuevo_texto = "; ".join(
+                        f"{campo}={valor or 'N/D'}"
+                        for campo, _, valor in cambios
+                    )[:255]
+
+                    crear_evento(
+                        conexion,
+                        componente,
+                        "HARDWARE_CHANGED",
+                        anterior_texto,
+                        nuevo_texto
+                    )
+
                 conexion.execute("""
                     UPDATE local_hardware
                     SET manufacturer = ?,
@@ -182,6 +279,9 @@ def comparar_inventario(inventario=None):
         # ==================================
 
         for clave, anterior in conocidos.items():
+
+            if clave[0] not in tipos_completos:
+                continue
 
             if clave in detectados:
                 continue

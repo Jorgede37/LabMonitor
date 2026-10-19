@@ -1,26 +1,11 @@
 
-import os
-from pathlib import Path
-
 import requests
-from dotenv import load_dotenv
 
-from config import SERVER_URL
+import config
 from local_database import (
     obtener_pendientes,
     marcar_enviado
 )
-
-
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
-
-AGENT_DIR = Path(__file__).resolve().parent
-
-load_dotenv(AGENT_DIR / ".env")
-
-AGENT_TOKEN = os.getenv("AGENT_TOKEN")
 
 
 # ==========================================
@@ -31,7 +16,7 @@ def sincronizar_eventos():
 
     print("\n===== SINCRONIZACIÓN DE EVENTOS =====")
 
-    if not AGENT_TOKEN:
+    if not config.AGENT_TOKEN:
         print("ERROR: Falta AGENT_TOKEN")
         return False
 
@@ -65,10 +50,10 @@ def sincronizar_eventos():
 
         try:
             respuesta = requests.post(
-                f"{SERVER_URL}/agent/events/sync",
+                f"{config.SERVER_URL}/agent/events/sync",
                 json={"events": eventos},
                 headers={
-                    "Authorization": f"Bearer {AGENT_TOKEN}"
+                    "Authorization": f"Bearer {config.AGENT_TOKEN}"
                 },
                 timeout=30
             )
