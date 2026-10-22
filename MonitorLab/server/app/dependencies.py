@@ -38,7 +38,8 @@ def obtener_usuario_actual(
     with engine.connect() as connection:
         resultado = connection.execute(
             text("""
-                SELECT id, username, full_name, role, is_active
+                         SELECT id, username, full_name, role, is_active,
+                             teacher_id, teacher_approved
                 FROM dbo.users
                 WHERE id = :user_id
             """),
@@ -63,3 +64,30 @@ def solo_administradores(
         )
 
     return usuario
+
+
+def solo_docentes_aprobados(
+    usuario: dict = Depends(obtener_usuario_actual)
+):
+    if usuario["role"] != "teacher" or not usuario["teacher_approved"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Acceso exclusivo para docentes autorizados"
+        )
+
+    return usuario
+
+
+def docentes_o_administradores(
+    usuario: dict = Depends(obtener_usuario_actual)
+):
+    if usuario["role"] == "admin":
+        return usuario
+
+    if usuario["role"] == "teacher" and usuario["teacher_approved"]:
+        return usuario
+
+    raise HTTPException(
+        status_code=status.HTTP_403_FORBIDDEN,
+        detail="Acceso exclusivo para docentes autorizados"
+    )

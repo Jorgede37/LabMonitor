@@ -1,6 +1,6 @@
 
 import logging
-import time
+import threading
 
 from datetime import datetime, timedelta, timezone
 from sqlalchemy import text
@@ -18,6 +18,11 @@ logger = logging.getLogger("LabMonitorEmailWorker")
 
 INTERVALO_SEGUNDOS = 5
 MAX_ERROR_LENGTH = 1000
+_worker_activo = threading.Event()
+
+
+def worker_correo_activo():
+    return _worker_activo.is_set()
 
 
 def obtener_notificacion():
@@ -182,35 +187,50 @@ def procesar_notificacion(notificacion):
         registrar_fallo(notificacion, error)
 
 
+def iniciar_worker_email(detener):
+    _worker_activo.set()
+
+    try:
+        logger.info("Iniciando LabMonitor Email Worker")
+        recuperacion_pendiente = True
+
+        logger.info(
+            "Consultando correos cada %s segundos",
+            INTERVALO_SEGUNDOS
+        )
+
+        while not detener.is_set():
+            try:
+                if recuperacion_pendiente:
+                    recuperar_interrumpidos()
+                    recuperacion_pendiente = False
+
+                notificacion = obtener_notificacion()
+
+                if notificacion is None:
+                    detener.wait(INTERVALO_SEGUNDOS)
+                    continue
+
+                procesar_notificacion(notificacion)
+
+            except Exception:
+                logger.exception(
+                    "Error general del worker"
+                )
+                detener.wait(INTERVALO_SEGUNDOS)
+
+    finally:
+        _worker_activo.clear()
+        logger.info("Worker de correo detenido")
+
+
 def main():
-    logger.info("Iniciando LabMonitor Email Worker")
+    detener = threading.Event()
 
-    recuperar_interrumpidos()
-
-    logger.info(
-        "Consultando correos cada %s segundos",
-        INTERVALO_SEGUNDOS
-    )
-
-    while True:
-        try:
-            notificacion = obtener_notificacion()
-
-            if notificacion is None:
-                time.sleep(INTERVALO_SEGUNDOS)
-                continue
-
-            procesar_notificacion(notificacion)
-
-        except KeyboardInterrupt:
-            logger.info("Worker detenido")
-            break
-
-        except Exception:
-            logger.exception(
-                "Error general del worker"
-            )
-            time.sleep(INTERVALO_SEGUNDOS)
+    try:
+        iniciar_worker_email(detener)
+    except KeyboardInterrupt:
+        detener.set()
 
 
 if __name__ == "__main__":

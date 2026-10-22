@@ -16,6 +16,8 @@ router = APIRouter(
 )
 
 TIPOS_PERMITIDOS = {
+    "cpu",
+    "motherboard",
     "ram",
     "gpu",
     "storage",
@@ -58,13 +60,11 @@ class ComponenteHardware(BaseModel):
 class InventarioHardware(BaseModel):
     components: list[ComponenteHardware]
     complete: bool = False
+    complete_types: list[str] | None = None
 
 
 class HeartbeatRequest(BaseModel):
-    idle_seconds: int = Field(
-        ge=0,
-        le=4294967
-    )
+    pass
 
 
 # ==========================================
@@ -122,20 +122,54 @@ def sincronizar_hardware(
             componente.component_type
         ] += 1
 
-    inventario_confiable = (
-        inventario.complete
-        and cantidades["ram"] > 0
-        and cantidades["gpu"] > 0
-        and cantidades["storage"] > 0
-        and cantidades["keyboard"] > 0
-    )
+    if inventario.complete_types is None:
+        if (
+            not inventario.complete
+            or any(
+                cantidades[tipo] == 0
+                for tipo in ("ram", "gpu", "storage", "keyboard")
+            )
+        ):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Inventario incompleto o no confiable. "
+                    "No se actualizara el estado del hardware."
+                )
+            )
+        tipos_consultados = set(TIPOS_PERMITIDOS)
+    else:
+        tipos_consultados = set(inventario.complete_types)
 
-    if not inventario_confiable:
+    if not tipos_consultados or not tipos_consultados.issubset(
+        TIPOS_PERMITIDOS
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="El inventario no contiene categorías confiables."
+        )
+
+    if any(
+        tipo in tipos_consultados and cantidades[tipo] == 0
+        for tipo in ("ram", "gpu", "storage", "keyboard")
+    ):
         raise HTTPException(
             status_code=400,
             detail=(
-                "Inventario incompleto o no confiable. "
-                "No se actualizara el estado del hardware."
+                "Una categoría obligatoria está vacía. "
+                "No se actualizará su estado."
+            )
+        )
+
+    if any(
+        componente.component_type not in tipos_consultados
+        for componente in inventario.components
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "El inventario incluye componentes de una "
+                "categoría no consultada correctamente."
             )
         )
 
@@ -252,6 +286,9 @@ def sincronizar_hardware(
 
         for clave, existente in componentes_db.items():
 
+            if clave[0] not in tipos_consultados:
+                continue
+
             if clave in presentes:
                 continue
 
@@ -299,7 +336,8 @@ def sincronizar_hardware(
         "events_created": 0,
         "total": len(inventario.components),
         "absence_check_enabled": False,
-        "event_source": "local_agent"
+        "event_source": "local_agent",
+        "complete_types": sorted(tipos_consultados)
     }
 
 
@@ -338,65 +376,53 @@ def registrar_heartbeat(
                 detail="Computadora no encontrada"
             )
 
-        # La ultima actividad se calcula restando
-        # la inactividad al momento de recepcion.
-        #
-        # Nunca retrocedemos last_activity_at.
-        # Nunca colocamos actividad anterior
-        # al inicio de la sesion.
-
-        sesiones = connection.execute(
-            text("""
-                UPDATE dbo.sessions
-                SET last_activity_at =
-                    CASE
-                        WHEN last_activity_at IS NULL
-                             OR last_activity_at <
-                                CASE
-                                    WHEN DATEADD(
-                                        SECOND,
-                                        -:idle_seconds,
-                                        SYSUTCDATETIME()
-                                    ) < login_at
-                                    THEN login_at
-                                    ELSE DATEADD(
-                                        SECOND,
-                                        -:idle_seconds,
-                                        SYSUTCDATETIME()
-                                    )
-                                END
-                        THEN
-                            CASE
-                                WHEN DATEADD(
-                                    SECOND,
-                                    -:idle_seconds,
-                                    SYSUTCDATETIME()
-                                ) < login_at
-                                THEN login_at
-                                ELSE DATEADD(
-                                    SECOND,
-                                    -:idle_seconds,
-                                    SYSUTCDATETIME()
-                                )
-                            END
-                        ELSE last_activity_at
-                    END
-                OUTPUT
-                    INSERTED.id,
-                    INSERTED.last_activity_at
-                WHERE computer_id = :computer_id
-                  AND logout_at IS NULL
-            """),
-            {
-                "computer_id": computer_id,
-                "idle_seconds": datos.idle_seconds
-            }
-        ).mappings().all()
-
     return {
         "message": "Heartbeat registrado",
         "computer_id": computer_id,
-        "last_seen": resultado.isoformat(),
-        "idle_seconds": datos.idle_seconds,
-        "active_sessions_updated": len(sesiones)
+        "last_seen": resultado.isoformat()
+    }
+
+# ==========================================
+# CONFIGURACION INICIAL DEL EQUIPO
+# ==========================================
+
+@router.get("/configuration")
+def consultar_configuracion_agente(
+    agente: dict = Depends(autenticar_agente)
+):
+    computer_id = agente["computer_id"]
+
+    with engine.connect() as connection:
+
+        computadora = connection.execute(
+            text("""
+                SELECT
+                    c.id,
+                    c.hostname,
+                    c.display_name,
+                    c.laboratory_id,
+                    l.name AS laboratory_name
+                FROM dbo.computers AS c
+                LEFT JOIN dbo.laboratories AS l
+                    ON c.laboratory_id = l.id
+                WHERE c.id = :computer_id
+            """),
+            {"computer_id": computer_id}
+        ).mappings().first()
+
+    if computadora is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Computadora no encontrada"
+        )
+
+    configurada = bool(computadora["display_name"])
+
+    return {
+        "computer_id": computadora["id"],
+        "hostname": computadora["hostname"],
+        "display_name": computadora["display_name"],
+        "laboratory_id": computadora["laboratory_id"],
+        "laboratory_name": computadora["laboratory_name"],
+        "configured": configurada
     }

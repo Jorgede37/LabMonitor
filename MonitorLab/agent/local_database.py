@@ -1,15 +1,57 @@
 
+
+import hashlib
+import hmac
+import os
 import sqlite3
 import uuid
+
 from pathlib import Path
 from datetime import datetime, timezone
 
 
+# ==========================================
+# ALMACENAMIENTO PERSISTENTE
+# ==========================================
+
 AGENT_DIR = Path(__file__).resolve().parent
-DATA_DIR = AGENT_DIR / "data"
-DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+PROGRAM_DATA = Path(
+    os.environ.get(
+        "PROGRAMDATA",
+        str(AGENT_DIR)
+    )
+)
+
+LABMONITOR_DIR = PROGRAM_DATA / "LabMonitor"
+
+DATA_DIR = LABMONITOR_DIR / "data"
 
 DB_PATH = DATA_DIR / "labmonitor_local.db"
+
+
+def huella_token(token):
+    return hashlib.sha256(
+        token.encode("utf-8")
+    ).hexdigest()
+
+
+def preparar_directorio_datos():
+    """
+    Crea la carpeta de datos si no existe.
+
+    Los permisos de acceso deben establecerse
+    durante la instalación de LabMonitor.
+    """
+
+    DATA_DIR.mkdir(
+        parents=True,
+        exist_ok=True
+    )
+
+
+preparar_directorio_datos()
+
 
 
 def conectar():
@@ -128,6 +170,22 @@ def inicializar_inventario_local():
             )
         """)
 
+        conexion.execute("""
+            CREATE TABLE IF NOT EXISTS hardware_baseline_types (
+                component_type TEXT PRIMARY KEY,
+                established_at TEXT NOT NULL
+            )
+        """)
+
+        conexion.execute("""
+            INSERT OR IGNORE INTO hardware_baseline_types (
+                component_type,
+                established_at
+            )
+            SELECT DISTINCT component_type, first_seen
+            FROM local_hardware
+        """)
+
 
 def obtener_inventario_local():
     """
@@ -184,6 +242,8 @@ def guardar_inventario_inicial(componentes):
             )
             return False
 
+        tipos = set()
+
         for componente in componentes:
             conexion.execute("""
                 INSERT INTO local_hardware (
@@ -207,6 +267,16 @@ def guardar_inventario_inicial(componentes):
                 fecha,
                 fecha
             ))
+            tipos.add(componente["component_type"])
+
+        for tipo in tipos:
+            conexion.execute("""
+                INSERT OR IGNORE INTO hardware_baseline_types (
+                    component_type,
+                    established_at
+                )
+                VALUES (?, ?)
+            """, (tipo, fecha))
 
     return True
 
@@ -251,9 +321,35 @@ def inicializar_sesiones_locales():
                             'closed',
                             'pending_close'
                         )
-                    )
+                    ),
+                close_reason TEXT
             )
         """)
+
+        columnas = {
+            fila["name"]
+            for fila in conexion.execute(
+                "PRAGMA table_info(local_sessions)"
+            ).fetchall()
+        }
+
+        if "close_reason" not in columnas:
+            conexion.execute(
+                "ALTER TABLE local_sessions "
+                "ADD COLUMN close_reason TEXT"
+            )
+
+        if "logout_token_hash" not in columnas:
+            conexion.execute(
+                "ALTER TABLE local_sessions "
+                "ADD COLUMN logout_token_hash TEXT"
+            )
+
+        if "previous_logout_token_hash" not in columnas:
+            conexion.execute(
+                "ALTER TABLE local_sessions "
+                "ADD COLUMN previous_logout_token_hash TEXT"
+            )
 
         conexion.execute("""
             CREATE UNIQUE INDEX IF NOT EXISTS
@@ -268,7 +364,8 @@ def guardar_sesion_local(
     user_id,
     computer_id,
     student_id,
-    login_at
+    login_at,
+    student_token
 ):
     inicializar_sesiones_locales()
 
@@ -280,15 +377,17 @@ def guardar_sesion_local(
                 computer_id,
                 student_id,
                 login_at,
-                status
+                status,
+                logout_token_hash
             )
-            VALUES (?, ?, ?, ?, ?, 'active')
+            VALUES (?, ?, ?, ?, ?, 'active', ?)
         """, (
             server_session_id,
             user_id,
             computer_id,
             student_id,
-            login_at
+            login_at,
+            huella_token(student_token)
         ))
 
 
@@ -311,17 +410,71 @@ def marcar_cierre_pendiente(server_session_id):
     inicializar_sesiones_locales()
 
     with conectar() as conexion:
-        conexion.execute("""
+        resultado = conexion.execute("""
             UPDATE local_sessions
-            SET status = 'pending_close'
+            SET status = 'pending_close',
+                logout_token_hash = NULL,
+                previous_logout_token_hash = NULL
             WHERE server_session_id = ?
               AND status = 'active'
         """, (server_session_id,))
 
+    if resultado.rowcount != 1:
+        raise RuntimeError(
+            "No se pudo guardar localmente la intención de cierre."
+        )
+
+
+def token_autoriza_cierre_offline(sesion, student_token):
+    huella = huella_token(student_token)
+
+    return any(
+        guardada is not None
+        and hmac.compare_digest(huella, guardada)
+        for guardada in (
+            sesion.get("logout_token_hash"),
+            sesion.get("previous_logout_token_hash")
+        )
+    )
+
+
+def actualizar_huellas_token_locales(
+    server_session_id,
+    token_presentado,
+    token_renovado
+):
+    inicializar_sesiones_locales()
+    huella_presentada = huella_token(token_presentado)
+    huella_renovada = huella_token(token_renovado)
+
+    with conectar() as conexion:
+        resultado = conexion.execute("""
+            UPDATE local_sessions
+            SET previous_logout_token_hash = logout_token_hash,
+                logout_token_hash = ?
+            WHERE server_session_id = ?
+              AND status = 'active'
+              AND (
+                  logout_token_hash = ?
+                  OR previous_logout_token_hash = ?
+              )
+        """, (
+            huella_renovada,
+            server_session_id,
+            huella_presentada,
+            huella_presentada
+        ))
+
+    if resultado.rowcount != 1:
+        raise RuntimeError(
+            "No se pudo actualizar el token local de la sesión."
+        )
+
 
 def confirmar_cierre_local(
     server_session_id,
-    logout_at
+    logout_at,
+    close_reason=None
 ):
     inicializar_sesiones_locales()
 
@@ -329,11 +482,15 @@ def confirmar_cierre_local(
         conexion.execute("""
             UPDATE local_sessions
             SET status = 'closed',
-                logout_at = ?
+                logout_at = ?,
+                close_reason = COALESCE(?, close_reason),
+                logout_token_hash = NULL,
+                previous_logout_token_hash = NULL
             WHERE server_session_id = ?
               AND status IN ('active', 'pending_close')
         """, (
             logout_at,
+            close_reason,
             server_session_id
         ))
 
@@ -351,3 +508,16 @@ def obtener_cierres_pendientes():
 
     return [dict(registro) for registro in registros]
 
+
+def obtener_sesiones_locales_abiertas():
+    inicializar_sesiones_locales()
+
+    with conectar() as conexion:
+        registros = conexion.execute("""
+            SELECT *
+            FROM local_sessions
+            WHERE status IN ('active', 'pending_close')
+            ORDER BY id ASC
+        """).fetchall()
+
+    return [dict(registro) for registro in registros]
