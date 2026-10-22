@@ -1,24 +1,8 @@
 
-import os
-
-from pathlib import Path
-
 import requests
-from dotenv import load_dotenv
 
-from config import SERVER_URL
+import config
 from hardware import obtener_inventario
-
-
-# ==========================================
-# CONFIGURACIÓN
-# ==========================================
-
-AGENT_DIR = Path(__file__).resolve().parent
-
-load_dotenv(AGENT_DIR / ".env")
-
-AGENT_TOKEN = os.getenv("AGENT_TOKEN")
 
 
 # ==========================================
@@ -27,7 +11,7 @@ AGENT_TOKEN = os.getenv("AGENT_TOKEN")
 
 def sincronizar(inventario=None):
 
-    if not AGENT_TOKEN:
+    if not config.AGENT_TOKEN:
         print("ERROR: Falta AGENT_TOKEN")
         return False
 
@@ -45,7 +29,13 @@ def sincronizar(inventario=None):
             )
             return False
 
-    componentes = inventario["components"]
+    tipos_completos = inventario.get("complete_types", [])
+    tipos_completos_set = set(tipos_completos)
+    componentes = [
+        componente
+        for componente in inventario["components"]
+        if componente["component_type"] in tipos_completos_set
+    ]
     completo = inventario["complete"]
     errores = inventario["errors"]
 
@@ -53,11 +43,11 @@ def sincronizar(inventario=None):
     print("Componentes detectados:", len(componentes))
     print("Inventario completo:", completo)
 
-    if not completo:
+    if not tipos_completos:
 
         print(
             "Sincronización cancelada: "
-            "inventario incompleto."
+            "ninguna categoría se consultó correctamente."
         )
 
         for error in errores:
@@ -68,13 +58,14 @@ def sincronizar(inventario=None):
     try:
 
         respuesta = requests.post(
-            f"{SERVER_URL}/agent/hardware/sync",
+            f"{config.SERVER_URL}/agent/hardware/sync",
             json={
                 "components": componentes,
-                "complete": completo
+                "complete": completo,
+                "complete_types": tipos_completos
             },
             headers={
-                "Authorization": f"Bearer {AGENT_TOKEN}"
+                "Authorization": f"Bearer {config.AGENT_TOKEN}"
             },
             timeout=30
         )

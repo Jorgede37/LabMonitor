@@ -1,6 +1,6 @@
 ﻿import logging
-import time
 import os
+import threading
 
 from dotenv import load_dotenv
 from sqlalchemy import text
@@ -16,18 +16,68 @@ load_dotenv()
 
 INTERVALO_REVISION = 5
 
-# PRUEBAS: 15 segundos
-# PRODUCCION: 300 segundos (5 minutos)
-TIMEOUT_INACTIVIDAD = 300
 
-# Perdida de comunicacion con el agente
-TIMEOUT_SIN_HEARTBEAT = 120
+def obtener_entero_entorno(nombre, predeterminado, minimo=1):
+    valor = os.getenv(nombre)
 
-# Solo computadora de pruebas
-load_dotenv()
+    if valor is None or not valor.strip():
+        return predeterminado
 
-COMPUTADORA_PRUEBA_ID = int(
-    os.getenv("COMPUTADORA_PRUEBA_ID", "2")
+    try:
+        resultado = int(valor)
+    except ValueError as error:
+        raise ValueError(
+            f"{nombre} debe ser un número entero."
+        ) from error
+
+    if resultado < minimo:
+        raise ValueError(
+            f"{nombre} debe ser mayor o igual a {minimo}."
+        )
+
+    return resultado
+
+
+# Test scope defaults to VM 2; production must explicitly use
+# "all" (or leave the setting blank) to cover every computer.
+def obtener_filtro_computadora(valor):
+    valor = valor.strip()
+
+    if valor.lower() in {"", "all", "*"}:
+        return None
+
+    try:
+        computer_id = int(valor)
+    except ValueError as error:
+        raise ValueError(
+            "COMPUTADORA_PRUEBA_ID debe ser un ID o 'all'."
+        ) from error
+
+    if computer_id <= 0:
+        raise ValueError(
+            "COMPUTADORA_PRUEBA_ID debe ser mayor que cero."
+        )
+
+    return computer_id
+
+
+TIMEOUT_INACTIVIDAD = obtener_entero_entorno(
+    # Test uses 15 seconds; production uses 300 seconds.
+    "LABMONITOR_IDLE_TIMEOUT_SECONDS",
+    300
+)
+
+TIMEOUT_SIN_HEARTBEAT = obtener_entero_entorno(
+    "LABMONITOR_HEARTBEAT_TIMEOUT_SECONDS",
+    120
+)
+
+valor_filtro_computadora = os.getenv(
+    "COMPUTADORA_PRUEBA_ID",
+    "2"
+)
+COMPUTADORA_PRUEBA_ID = obtener_filtro_computadora(
+    valor_filtro_computadora
 )
 
 
@@ -57,7 +107,8 @@ def cerrar_sesiones_inactivas():
             text("""
                 UPDATE s
 
-                SET logout_at = SYSUTCDATETIME()
+                SET logout_at = SYSUTCDATETIME(),
+                    close_reason = 'inactivity'
 
                 OUTPUT
                     INSERTED.id,
@@ -88,9 +139,8 @@ def cerrar_sesiones_inactivas():
                       SYSUTCDATETIME()
                   )
 
-                  -- Debemos haber recibido
-                  -- al menos una medicion de
-                  -- actividad para esta sesion.
+                  -- Solo se aceptan señales de actividad
+                  -- reportadas desde el cliente interactivo.
 
                   AND s.last_activity_at IS NOT NULL
 
@@ -100,11 +150,7 @@ def cerrar_sesiones_inactivas():
                       SYSUTCDATETIME()
                   )
 
-                  AND s.login_at < DATEADD(
-                      SECOND,
-                      -:timeout_inactividad,
-                      SYSUTCDATETIME()
-                  )
+                  AND s.login_at <= s.last_activity_at
             """),
             {
                 "computer_id": COMPUTADORA_PRUEBA_ID,
@@ -128,7 +174,8 @@ def cerrar_sesiones_sin_heartbeat():
             text("""
                 UPDATE s
 
-                SET logout_at = SYSUTCDATETIME()
+                SET logout_at = SYSUTCDATETIME(),
+                    close_reason = 'heartbeat_lost'
 
                 OUTPUT
                     INSERTED.id,
@@ -176,7 +223,36 @@ def cerrar_sesiones_sin_heartbeat():
 # CICLO PRINCIPAL
 # ==========================================
 
-def iniciar_worker():
+def procesar_sesiones_expiradas():
+    inactivas = cerrar_sesiones_inactivas()
+
+    for sesion in inactivas:
+        logger.warning(
+            "Sesión %s cerrada por inactividad "
+            "(computadora %s, fecha %s)",
+            sesion["id"],
+            sesion["computer_id"],
+            sesion["logout_at"]
+        )
+
+    desconectadas = cerrar_sesiones_sin_heartbeat()
+
+    for sesion in desconectadas:
+        logger.warning(
+            "Sesión %s cerrada por pérdida de comunicación "
+            "(computadora %s, fecha %s)",
+            sesion["id"],
+            sesion["computer_id"],
+            sesion["logout_at"]
+        )
+
+    if not inactivas and not desconectadas:
+        logger.info("Sin sesiones expiradas")
+
+
+def iniciar_worker(detener=None):
+    if detener is None:
+        detener = threading.Event()
 
     logger.info(
         "Session Worker iniciado"
@@ -197,57 +273,19 @@ def iniciar_worker():
         TIMEOUT_SIN_HEARTBEAT
     )
 
-    logger.info(
-        "Computadora de prueba: %s",
-        COMPUTADORA_PRUEBA_ID
-    )
+    if COMPUTADORA_PRUEBA_ID is None:
+        logger.info("Filtro de computadora: todos los equipos")
+    else:
+        logger.info(
+            "Filtro de computadora de prueba: %s",
+            COMPUTADORA_PRUEBA_ID
+        )
 
-    while True:
+    while not detener.is_set():
 
         try:
 
-            # ==================================
-            # 1. CIERRE POR INACTIVIDAD
-            # ==================================
-
-            inactivas = (
-                cerrar_sesiones_inactivas()
-            )
-
-            for sesion in inactivas:
-
-                logger.warning(
-                    "Sesion %s cerrada por inactividad "
-                    "(computadora %s, fecha %s)",
-                    sesion["id"],
-                    sesion["computer_id"],
-                    sesion["logout_at"]
-                )
-
-            # ==================================
-            # 2. CIERRE POR FALTA DE HEARTBEAT
-            # ==================================
-
-            desconectadas = (
-                cerrar_sesiones_sin_heartbeat()
-            )
-
-            for sesion in desconectadas:
-
-                logger.warning(
-                    "Sesion %s cerrada por perdida "
-                    "de comunicacion "
-                    "(computadora %s, fecha %s)",
-                    sesion["id"],
-                    sesion["computer_id"],
-                    sesion["logout_at"]
-                )
-
-            if not inactivas and not desconectadas:
-
-                logger.info(
-                    "Sin sesiones expiradas"
-                )
+            procesar_sesiones_expiradas()
 
         except Exception:
 
@@ -255,9 +293,7 @@ def iniciar_worker():
                 "Error revisando sesiones"
             )
 
-        time.sleep(
-            INTERVALO_REVISION
-        )
+        detener.wait(INTERVALO_REVISION)
 
 
 # ==========================================

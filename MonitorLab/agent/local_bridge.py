@@ -1,22 +1,36 @@
 
 import json
+import base64
+import hmac
 import os
-import sys
 import threading
+import time
 
-import win32api
 import win32con
 import win32file
 import win32pipe
 import win32security
+import win32crypt
 import pywintypes
+import pythoncom
+
+import config
+from logger import logger
+from assigned_access import cambiar_acceso_asignado
+from configuration import consultar_configuracion_equipo
+from register import (
+    guardar_nuevo_servidor,
+    registrar_computadora_con_administrador,
+    validar_url_servidor,
+)
 
 from session_manager import (
     iniciar_sesion_estudiante,
     consultar_sesion_estudiante,
     cerrar_sesion_estudiante,
+    registrar_actividad_estudiante,
     recuperar_cierres_pendientes,
-    sincronizar_sesion_servidor,
+    consultar_estado_sesion_estudiante,
     SessionManagerError,
 )
 
@@ -26,11 +40,121 @@ from session_manager import (
 # ==========================================
 
 PIPE_NAME = r"\\.\pipe\LabMonitorStudent"
+
 BUFFER_SIZE = 65536
 RECOVERY_INTERVAL = 30
 
+MAX_CLIENTES = 16
+
 session_lock = threading.RLock()
+
 stop_event = threading.Event()
+
+clientes_disponibles = threading.BoundedSemaphore(
+    MAX_CLIENTES
+)
+
+hilos_clientes = set()
+hilos_lock = threading.Lock()
+intentos_admin_locales = []
+admin_local_bloqueado_hasta = 0
+admin_local_lock = threading.Lock()
+
+USUARIO_ADMIN_LOCAL = "Sistemas_Admin"
+ENTROPIA_ADMIN_LOCAL = b"LabMonitor.LocalAdmin.v1"
+MAX_INTENTOS_ADMIN_LOCAL = 5
+VENTANA_INTENTOS_ADMIN_LOCAL = 300
+DURACION_BLOQUEO_ADMIN_LOCAL = 300
+
+
+def autenticar_admin_local(usuario, password):
+    global admin_local_bloqueado_hasta
+
+    ahora = time.monotonic()
+    with admin_local_lock:
+        if ahora < admin_local_bloqueado_hasta:
+            raise SessionManagerError(
+                "Demasiados intentos. Espera cinco minutos e intenta de nuevo."
+            )
+
+        intentos_admin_locales[:] = [
+            intento
+            for intento in intentos_admin_locales
+            if ahora - intento < VENTANA_INTENTOS_ADMIN_LOCAL
+        ]
+
+        secreto_protegido = config.LOCAL_ADMIN_SECRET
+        if not secreto_protegido:
+            raise SessionManagerError(
+                "No está configurada la contraseña local de administrador."
+            )
+
+        try:
+            secreto = win32crypt.CryptUnprotectData(
+                base64.b64decode(secreto_protegido, validate=True),
+                ENTROPIA_ADMIN_LOCAL,
+                None,
+                None,
+                0
+            )[1]
+        except (ValueError, TypeError, pywintypes.error) as error:
+            raise SessionManagerError(
+                "No fue posible validar la credencial local protegida."
+            ) from error
+
+        usuario_valido = (
+            isinstance(usuario, str)
+            and usuario == USUARIO_ADMIN_LOCAL
+        )
+        password_valido = False
+        if isinstance(password, str):
+            try:
+                password_valido = hmac.compare_digest(
+                    password.encode("utf-8"),
+                    secreto
+                )
+            except UnicodeEncodeError:
+                password_valido = False
+
+        if usuario_valido and password_valido:
+            intentos_admin_locales.clear()
+            admin_local_bloqueado_hasta = 0
+            return
+
+        intentos_admin_locales.append(ahora)
+        if len(intentos_admin_locales) >= MAX_INTENTOS_ADMIN_LOCAL:
+            admin_local_bloqueado_hasta = (
+                ahora + DURACION_BLOQUEO_ADMIN_LOCAL
+            )
+            intentos_admin_locales.clear()
+
+        raise SessionManagerError(
+            "El usuario o la contraseña local no son válidos."
+        )
+
+
+def cambiar_servidor_con_admin_local(solicitud):
+    usuario = solicitud.get("local_admin_username")
+    password = solicitud.get("local_admin_password")
+    url_servidor = solicitud.get("server_url")
+
+    autenticar_admin_local(usuario, password)
+    if not isinstance(url_servidor, str):
+        raise SessionManagerError(
+            "La dirección del servidor no es válida."
+        )
+
+    try:
+        url_servidor = validar_url_servidor(url_servidor)
+        with session_lock:
+            guardar_nuevo_servidor(url_servidor)
+    except (OSError, RuntimeError, ValueError) as error:
+        raise SessionManagerError(str(error)) from error
+
+    return {
+        "server_url": url_servidor,
+        "configured": False,
+    }
 
 
 # ==========================================
@@ -38,44 +162,57 @@ stop_event = threading.Event()
 # ==========================================
 
 def crear_atributos_seguridad():
+    """
+    Permite conexiones locales de usuarios
+    autenticados.
 
-    proceso = win32api.GetCurrentProcess()
+    El token privado del agente nunca se
+    entrega mediante el Named Pipe.
 
-    token = win32security.OpenProcessToken(
-        proceso,
-        win32security.TOKEN_QUERY
-    )
-
-    try:
-        usuario_sid = win32security.GetTokenInformation(
-            token,
-            win32security.TokenUser
-        )[0]
-    finally:
-        token.Close()
+    Las operaciones estudiantiles se validan
+    mediante el servidor FastAPI.
+    """
 
     system_sid = win32security.CreateWellKnownSid(
         win32security.WinLocalSystemSid,
         None
     )
 
+    admins_sid = win32security.CreateWellKnownSid(
+        win32security.WinBuiltinAdministratorsSid,
+        None
+    )
+
+    usuarios_sid = win32security.CreateWellKnownSid(
+        win32security.WinAuthenticatedUserSid,
+        None
+    )
+
     dacl = win32security.ACL()
 
-    permisos = (
-        win32con.GENERIC_READ
-        | win32con.GENERIC_WRITE
-    )
-
     dacl.AddAccessAllowedAce(
         win32security.ACL_REVISION,
-        permisos,
-        usuario_sid
-    )
-
-    dacl.AddAccessAllowedAce(
-        win32security.ACL_REVISION,
-        permisos,
+        win32con.GENERIC_ALL,
         system_sid
+    )
+
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION,
+        win32con.GENERIC_ALL,
+        admins_sid
+    )
+
+    permisos_cliente = (
+    0x0001      # FILE_READ_DATA
+    | 0x0002    # FILE_WRITE_DATA
+    | 0x0100    # FILE_WRITE_ATTRIBUTES
+    | 0x00100000  # SYNCHRONIZE
+)
+
+    dacl.AddAccessAllowedAce(
+        win32security.ACL_REVISION,
+        permisos_cliente,
+        usuarios_sid
     )
 
     descriptor = win32security.SECURITY_DESCRIPTOR()
@@ -87,6 +224,7 @@ def crear_atributos_seguridad():
     )
 
     atributos = pywintypes.SECURITY_ATTRIBUTES()
+
     atributos.SECURITY_DESCRIPTOR = descriptor
 
     return atributos
@@ -97,7 +235,6 @@ def crear_atributos_seguridad():
 # ==========================================
 
 def ejecutar_recuperacion():
-
     try:
         with session_lock:
             resumen = recuperar_cierres_pendientes()
@@ -109,31 +246,22 @@ def ejecutar_recuperacion():
         if total == 0:
             return
 
-        print()
         print(
-            "[RECUPERACION] Sesiones pendientes:",
+            "[RECUPERACION] Pendientes:",
             total
         )
+
         print(
             "[RECUPERACION] Recuperadas:",
             recuperadas
         )
 
-        if errores:
-            for error in errores:
-                print(
-                    "[RECUPERACION] Pendiente:",
-                    error["session_id"],
-                    "-",
-                    error["error"]
-                )
-        else:
+        for error in errores:
             print(
-                "[RECUPERACION] "
-                "Sincronizacion completada."
+                "[RECUPERACION] Error:",
+                error["session_id"],
+                error["error"]
             )
-
-        print()
 
     except Exception as error:
         print(
@@ -144,82 +272,184 @@ def ejecutar_recuperacion():
 
 
 def ciclo_recuperacion():
-
-    print("[RECUPERACION] Servicio iniciado.")
+    print("[RECUPERACION] Hilo iniciado.")
 
     while not stop_event.is_set():
-
         ejecutar_recuperacion()
 
         if stop_event.wait(RECOVERY_INTERVAL):
             break
 
-    print("[RECUPERACION] Servicio detenido.")
+    print("[RECUPERACION] Hilo detenido.")
 
 
 # ==========================================
-# PROCESAR SOLICITUDES
+# VALIDACION DE SOLICITUDES
 # ==========================================
+
+def obtener_token_estudiante(solicitud):
+    token = solicitud.get("student_token")
+
+    if (
+        not isinstance(token, str)
+        or not token.strip()
+    ):
+        raise SessionManagerError(
+            "Falta el token del estudiante."
+        )
+
+    return token
+
 
 def procesar_solicitud(solicitud):
-
     if not isinstance(solicitud, dict):
         return {
             "ok": False,
-            "error": "La solicitud debe ser un objeto JSON."
+            "error": (
+                "La solicitud debe ser "
+                "un objeto JSON."
+            )
         }
 
     accion = solicitud.get("action")
-    student_token = solicitud.get("student_token")
-
-    if not isinstance(student_token, str):
-        return {
-            "ok": False,
-            "error": "Falta el token del estudiante."
-        }
-
-    if not student_token.strip():
-        return {
-            "ok": False,
-            "error": "El token del estudiante esta vacio."
-        }
 
     try:
+        # ----------------------------------
+        # CONFIGURACION DE LA COMPUTADORA
+        # ----------------------------------
+
+        if accion == "configuration":
+            with session_lock:
+                resultado = (
+                    consultar_configuracion_equipo()
+                )
+
+            return {
+                "ok": True,
+                "data": resultado
+            }
+
+        if accion == "update-server-url":
+            resultado = cambiar_servidor_con_admin_local(
+                solicitud
+            )
+            return {
+                "ok": True,
+                "data": resultado
+            }
+
+        if accion == "register":
+            if config.AGENT_TOKEN:
+                raise SessionManagerError(
+                    "El agente ya esta registrado. No se repetira el registro."
+                )
+            admin_token = solicitud.get("admin_token")
+            server_url = solicitud.get("server_url")
+            if not isinstance(admin_token, str) or not admin_token.strip():
+                raise SessionManagerError(
+                    "Inicia sesion como administrador de LabMonitor para registrar este equipo."
+                )
+            if (
+                not isinstance(server_url, str)
+                or server_url.rstrip("/") != config.SERVER_URL
+            ):
+                raise SessionManagerError(
+                    "La direccion del servidor no coincide con la configuracion de instalacion."
+                )
+
+            with session_lock:
+                try:
+                    resultado = registrar_computadora_con_administrador(
+                        config.SERVER_URL,
+                        admin_token
+                    )
+                except (RuntimeError, ValueError) as error:
+                    raise SessionManagerError(str(error)) from error
+
+            return {
+                "ok": True,
+                "data": resultado
+            }
+
+        if accion == "assigned-access":
+            admin_token = solicitud.get("admin_token")
+            operation = solicitud.get("operation")
+            windows_account = solicitud.get("windows_account")
+            try:
+                with session_lock:
+                    resultado = cambiar_acceso_asignado(
+                        operation,
+                        windows_account,
+                        admin_token
+                    )
+            except (RuntimeError, ValueError) as error:
+                raise SessionManagerError(str(error)) from error
+
+            return {
+                "ok": True,
+                "data": resultado
+            }
+
+        # ----------------------------------
+        # OPERACIONES PERMITIDAS
+        # ----------------------------------
+
+        acciones_permitidas = {
+            "start",
+            "current",
+            "end",
+            "status",
+            "activity"
+        }
+
+        if accion not in acciones_permitidas:
+            return {
+                "ok": False,
+                "error": "Operación no permitida."
+            }
+
+        student_token = obtener_token_estudiante(
+            solicitud
+        )
+
+        # ----------------------------------
+        # OPERACIONES DEL ESTUDIANTE
+        # ----------------------------------
+
         with session_lock:
 
             if accion == "start":
-
                 resultado = iniciar_sesion_estudiante(
                     student_token
                 )
 
             elif accion == "current":
-
                 resultado = consultar_sesion_estudiante(
                     student_token
                 )
 
             elif accion == "end":
-
                 resultado = cerrar_sesion_estudiante(
                     student_token
                 )
 
             elif accion == "status":
-
-                session_id = solicitud.get("session_id")
-
-                # Consulta SQL Server y, si la sesion
-                # termino, sincroniza SQLite.
-                resultado = sincronizar_sesion_servidor(
-                    session_id
+                session_id = solicitud.get(
+                    "session_id"
                 )
 
-            else:
-                return {
-                    "ok": False,
-                    "error": "Operacion no permitida."
-                }
+                resultado = (
+                    consultar_estado_sesion_estudiante(
+                        student_token,
+                        session_id
+                    )
+                )
+
+            elif accion == "activity":
+                resultado = registrar_actividad_estudiante(
+                    student_token,
+                    solicitud.get("session_id")
+                )
 
         return {
             "ok": True,
@@ -233,8 +463,12 @@ def procesar_solicitud(solicitud):
         }
 
     except Exception as error:
+        logger.exception(
+            "Error interno procesando la acción local %r.",
+            accion
+        )
         print(
-            "[ERROR] Fallo interno:",
+            "[ERROR] Solicitud:",
             type(error).__name__,
             str(error)
         )
@@ -246,26 +480,22 @@ def procesar_solicitud(solicitud):
 
 
 # ==========================================
-# ENVIAR RESPUESTA
+# COMUNICACION
 # ==========================================
 
 def enviar_respuesta(pipe, respuesta):
-
     contenido = json.dumps(
         respuesta,
         ensure_ascii=False
     ).encode("utf-8")
 
-    win32file.WriteFile(pipe, contenido)
-    win32file.FlushFileBuffers(pipe)
+    win32file.WriteFile(
+        pipe,
+        contenido
+    )
 
-
-# ==========================================
-# ATENDER CLIENTE
-# ==========================================
 
 def atender_cliente(pipe):
-
     try:
         _, contenido = win32file.ReadFile(
             pipe,
@@ -276,7 +506,9 @@ def atender_cliente(pipe):
             contenido.decode("utf-8")
         )
 
-        respuesta = procesar_solicitud(solicitud)
+        respuesta = procesar_solicitud(
+            solicitud
+        )
 
     except (
         json.JSONDecodeError,
@@ -284,36 +516,206 @@ def atender_cliente(pipe):
     ):
         respuesta = {
             "ok": False,
-            "error": "La solicitud contiene JSON invalido."
+            "error": (
+                "La solicitud contiene "
+                "JSON inválido."
+            )
         }
 
     except pywintypes.error as error:
-        print(
-            "[ERROR] Comunicacion local:",
-            error.winerror
-        )
+        if not stop_event.is_set():
+            print(
+                "[ERROR] Comunicación local:",
+                error.winerror
+            )
         return
 
-    enviar_respuesta(pipe, respuesta)
+    except Exception as error:
+        if not stop_event.is_set():
+            print(
+                "[ERROR] Cliente:",
+                type(error).__name__,
+                str(error)
+            )
+        return
+
+    if stop_event.is_set():
+        return
+
+    try:
+        enviar_respuesta(
+            pipe,
+            respuesta
+        )
+
+    except pywintypes.error as error:
+        if not stop_event.is_set():
+            print(
+                "[ERROR] Envío de respuesta:",
+                error.winerror
+            )
+
+
+def cerrar_pipe(pipe):
+    try:
+        win32pipe.DisconnectNamedPipe(
+            pipe
+        )
+    except pywintypes.error:
+        pass
+
+    try:
+        win32file.CloseHandle(
+            pipe
+        )
+    except pywintypes.error:
+        pass
+
+
+# ==========================================
+# CLIENTES INDEPENDIENTES
+# ==========================================
+
+def ejecutar_cliente(pipe):
+    try:
+        pythoncom.CoInitialize()
+        try:
+            atender_cliente(pipe)
+        finally:
+            pythoncom.CoUninitialize()
+
+    finally:
+        cerrar_pipe(pipe)
+
+        clientes_disponibles.release()
+
+        with hilos_lock:
+            hilos_clientes.discard(
+                threading.current_thread()
+            )
+
+
+def iniciar_hilo_cliente(pipe):
+    """
+    Cada cliente se atiende independientemente.
+
+    Un cliente que no envíe información no
+    bloquea la aceptación de otros clientes.
+
+    Los hilos son daemon para no impedir
+    la salida del proceso durante la parada.
+    """
+
+    hilo = threading.Thread(
+        target=ejecutar_cliente,
+        args=(pipe,),
+        name="LabMonitorPipeClient",
+        daemon=True
+    )
+
+    with hilos_lock:
+        hilos_clientes.add(hilo)
+
+    try:
+        hilo.start()
+
+    except Exception:
+        with hilos_lock:
+            hilos_clientes.discard(hilo)
+
+        clientes_disponibles.release()
+        cerrar_pipe(pipe)
+        raise
+
+
+# ==========================================
+# DESPERTAR PIPE AL DETENER
+# ==========================================
+
+def despertar_pipe():
+    """
+    Realiza una conexión local para desbloquear
+    ConnectNamedPipe durante la detención.
+
+    No realiza operaciones estudiantiles.
+    """
+
+    pipe = None
+
+    try:
+        pipe = win32file.CreateFile(
+            PIPE_NAME,
+            win32con.GENERIC_READ
+            | win32con.GENERIC_WRITE,
+            0,
+            None,
+            win32con.OPEN_EXISTING,
+            0,
+            None
+        )
+
+        win32file.WriteFile(
+            pipe,
+            b'{"action":"__stop__"}'
+        )
+
+    except pywintypes.error:
+        pass
+
+    finally:
+        if pipe is not None:
+            try:
+                win32file.CloseHandle(
+                    pipe
+                )
+            except pywintypes.error:
+                pass
+
+
+def solicitar_detencion():
+    stop_event.set()
+    despertar_pipe()
+
+
+def observar_detencion():
+    stop_event.wait()
+    despertar_pipe()
 
 
 # ==========================================
 # SERVIDOR NAMED PIPE
 # ==========================================
 
-def iniciar_puente():
+def iniciar_puente(evento_detencion=None):
+    """
+    Inicia el puente local.
+
+    evento_detencion permite compartir la
+    señal de parada con windows_service.py.
+    """
+
+    global stop_event
+
+    if os.name != "nt":
+        raise RuntimeError(
+            "LabMonitor Local Bridge requiere Windows."
+        )
+
+    if evento_detencion is not None:
+        stop_event = evento_detencion
+
+    if stop_event.is_set():
+        return
 
     print("=" * 45)
     print("LabMonitor - Puente local")
     print("=" * 45)
-
     print("Pipe:", PIPE_NAME)
-    print("Modo: pruebas locales")
     print(
-        "Recuperacion automatica:",
-        f"cada {RECOVERY_INTERVAL} segundos"
+        "Recuperación:",
+        RECOVERY_INTERVAL,
+        "segundos"
     )
-    print()
 
     atributos = crear_atributos_seguridad()
 
@@ -325,82 +727,119 @@ def iniciar_puente():
 
     hilo_recuperacion.start()
 
-    print("Esperando solicitudes...")
-    print()
+    hilo_detencion = threading.Thread(
+        target=observar_detencion,
+        name="LabMonitorPipeStop",
+        daemon=True
+    )
 
-    while True:
+    hilo_detencion.start()
 
-        pipe = None
+    print("[PUENTE] Esperando solicitudes...")
 
-        try:
-            pipe = win32pipe.CreateNamedPipe(
-                PIPE_NAME,
-                win32pipe.PIPE_ACCESS_DUPLEX,
-                (
-                    win32pipe.PIPE_TYPE_MESSAGE
-                    | win32pipe.PIPE_READMODE_MESSAGE
-                    | win32pipe.PIPE_WAIT
-                    | win32pipe.PIPE_REJECT_REMOTE_CLIENTS
-                ),
-                1,
-                BUFFER_SIZE,
-                BUFFER_SIZE,
-                0,
-                atributos
-            )
+    try:
+        while not stop_event.is_set():
+            pipe = None
+            permiso_adquirido = False
 
             try:
-                win32pipe.ConnectNamedPipe(
-                    pipe,
-                    None
+                # Evitar crear conexiones ilimitadas.
+                while not stop_event.is_set():
+                    permiso_adquirido = (
+                        clientes_disponibles.acquire(
+                            timeout=0.5
+                        )
+                    )
+
+                    if permiso_adquirido:
+                        break
+
+                if stop_event.is_set():
+                    break
+
+                pipe = win32pipe.CreateNamedPipe(
+                    PIPE_NAME,
+                    win32pipe.PIPE_ACCESS_DUPLEX,
+                    (
+                        win32pipe.PIPE_TYPE_MESSAGE
+                        | win32pipe.PIPE_READMODE_MESSAGE
+                        | win32pipe.PIPE_WAIT
+                        | win32pipe.PIPE_REJECT_REMOTE_CLIENTS
+                    ),
+                    MAX_CLIENTES,
+                    BUFFER_SIZE,
+                    BUFFER_SIZE,
+                    0,
+                    atributos
+                )
+
+                try:
+                    win32pipe.ConnectNamedPipe(
+                        pipe,
+                        None
+                    )
+
+                except pywintypes.error as error:
+                    # ERROR_PIPE_CONNECTED
+                    if error.winerror != 535:
+                        raise
+
+                if stop_event.is_set():
+                    break
+
+                # El hilo se hace responsable
+                # del pipe y del semáforo.
+                pipe_cliente = pipe
+                pipe = None
+
+                permiso_adquirido = False
+
+                iniciar_hilo_cliente(
+                    pipe_cliente
                 )
 
             except pywintypes.error as error:
-                if error.winerror != 535:
-                    raise
+                if not stop_event.is_set():
+                    print(
+                        "[ERROR] Named Pipe:",
+                        error.winerror,
+                        error.strerror
+                    )
 
-            atender_cliente(pipe)
+            except Exception as error:
+                if not stop_event.is_set():
+                    print(
+                        "[ERROR] Puente local:",
+                        type(error).__name__,
+                        str(error)
+                    )
 
-        except pywintypes.error as error:
-            print(
-                "[ERROR] Named Pipe:",
-                error.winerror,
-                error.strerror
-            )
+            finally:
+                if pipe is not None:
+                    cerrar_pipe(pipe)
 
-        except Exception as error:
-            print(
-                "[ERROR] Puente local:",
-                type(error).__name__,
-                str(error)
-            )
+                if permiso_adquirido:
+                    clientes_disponibles.release()
 
-        finally:
-            if pipe is not None:
+    finally:
+        stop_event.set()
 
-                try:
-                    win32pipe.DisconnectNamedPipe(pipe)
-                except pywintypes.error:
-                    pass
+        hilo_recuperacion.join(timeout=2)
 
-                win32file.CloseHandle(pipe)
+        print("[PUENTE] Detenido.")
 
 
 # ==========================================
-# INICIO
+# INICIO INDEPENDIENTE
 # ==========================================
 
 if __name__ == "__main__":
-
-    if os.name != "nt":
-        sys.exit(
-            "LabMonitor Local Bridge requiere Windows."
-        )
-
     try:
         iniciar_puente()
 
     except KeyboardInterrupt:
-        stop_event.set()
-        print()
-        print("Puente local detenido.")
+        solicitar_detencion()
+
+        print(
+            "[PUENTE] Detenido por el usuario."
+        )

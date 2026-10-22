@@ -9,12 +9,20 @@ from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
 
 from dotenv import load_dotenv
+from sqlalchemy import text
+
+from app.database import engine
 
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 load_dotenv(BASE_DIR / ".env")
 
 logger = logging.getLogger(__name__)
+FIRMA_INSTITUCIONAL = (
+    "Departamento de Sistemas\n"
+    "Universidad de Durango\n"
+    "Campus Aguascalientes"
+)
 
 
 def obtener_configuracion():
@@ -35,14 +43,109 @@ def obtener_configuracion():
     }
 
 
-def obtener_correos_administradores():
-    correos = os.getenv("ADMIN_ALERT_EMAILS", "")
+def obtener_url_dashboard():
+    return os.getenv(
+        "LABMONITOR_DASHBOARD_URL",
+        "http://127.0.0.1:5174"
+    ).strip().rstrip("/")
 
-    return list(dict.fromkeys(
-        correo.strip()
-        for correo in correos.split(",")
-        if correo.strip()
-    ))
+
+def obtener_correos_administradores():
+    """Return unique email addresses for currently active administrators."""
+    with engine.connect() as connection:
+        resultado = connection.execute(
+            text("""
+                SELECT email
+                FROM dbo.users
+                WHERE role = 'admin'
+                  AND is_active = 1
+                  AND email IS NOT NULL
+                  AND LTRIM(RTRIM(email)) <> ''
+                ORDER BY id
+            """)
+        )
+        correos = resultado.scalars().all()
+
+    destinatarios = []
+    vistos = set()
+    for valor in correos:
+        if not isinstance(valor, str):
+            continue
+        correo = valor.strip()
+        clave = correo.casefold()
+        _nombre, direccion = parseaddr(correo)
+        if (
+            not correo
+            or direccion.casefold() != clave
+            or correo.count("@") != 1
+            or "." not in correo.rsplit("@", 1)[1]
+            or any(caracter.isspace() for caracter in correo)
+            or "\r" in correo
+            or "\n" in correo
+            or clave in vistos
+        ):
+            continue
+        vistos.add(clave)
+        destinatarios.append(correo)
+
+    return destinatarios
+
+
+def obtener_administradores_con_correo():
+    """Return active administrators and valid email addresses for approval links."""
+    with engine.connect() as connection:
+        filas = connection.execute(
+            text("""
+                SELECT id, email
+                FROM dbo.users
+                WHERE role = 'admin'
+                  AND is_active = 1
+                  AND email IS NOT NULL
+                  AND LTRIM(RTRIM(email)) <> ''
+                ORDER BY id
+            """)
+        ).mappings().all()
+
+    administradores = []
+    vistos = set()
+    for fila in filas:
+        correo = fila["email"].strip() if isinstance(fila["email"], str) else ""
+        clave = correo.casefold()
+        _nombre, direccion = parseaddr(correo)
+        if (
+            not correo
+            or direccion.casefold() != clave
+            or correo.count("@") != 1
+            or "." not in correo.rsplit("@", 1)[1]
+            or any(caracter.isspace() for caracter in correo)
+            or "\r" in correo
+            or "\n" in correo
+            or clave in vistos
+        ):
+            continue
+        vistos.add(clave)
+        administradores.append({"id": fila["id"], "email": correo})
+
+    return administradores
+
+
+def obtener_estado_configuracion_correo():
+    config = obtener_configuracion()
+    destinatarios = obtener_correos_administradores()
+    smtp_configurado = (
+        bool(config["host"])
+        and config["port"] > 0
+        and bool(config["user"])
+        and bool(config["password"])
+        and not config["password"].startswith("PEGA_AQUI")
+        and bool(config["use_tls"])
+    )
+
+    return {
+        "smtp_configured": smtp_configurado,
+        "recipient_count": len(destinatarios),
+        "ready": smtp_configurado and bool(destinatarios)
+    }
 
 
 def enviar_correo(destinatario, asunto, mensaje):
@@ -102,7 +205,10 @@ def enviar_correo(destinatario, asunto, mensaje):
 
     correo["To"] = ", ".join(destinatarios)
     correo["Subject"] = asunto
-    correo.set_content(mensaje)
+    cuerpo = mensaje.rstrip()
+    if "Departamento de Sistemas" not in cuerpo:
+        cuerpo = f"{cuerpo}\n\n{FIRMA_INSTITUCIONAL}"
+    correo.set_content(cuerpo)
 
     contexto = ssl.create_default_context()
 
@@ -284,3 +390,31 @@ Campus Aguascalientes
         asunto,
         mensaje
     )
+
+
+def enviar_codigo_verificacion(
+    destinatario,
+    nombre,
+    codigo
+):
+    asunto = "LabMonitor - Código de seguridad"
+    mensaje = f"""
+Hola, {nombre}:
+
+Se creó una cuenta de estudiante para LabMonitor.
+Ingresa este código en la aplicación LabMonitor para
+verificar tu correo y habilitar el inicio de sesión:
+
+{codigo}
+
+El código vence en 15 minutos y solo puede usarse una vez.
+Si no solicitaste esta cuenta, puedes ignorar este mensaje.
+
+========================================
+
+LabMonitor
+Universidad de Durango
+Campus Aguascalientes
+"""
+
+    return enviar_correo(destinatario, asunto, mensaje)

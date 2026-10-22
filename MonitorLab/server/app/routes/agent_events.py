@@ -1,27 +1,50 @@
 
-import os
+import logging
 
 from datetime import datetime
+from datetime import timezone
 from uuid import UUID
 from zoneinfo import ZoneInfo
 
-from dotenv import load_dotenv
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 
 from app.agent_auth import autenticar_agente
 from app.database import engine
+from app.email_service import obtener_correos_administradores
 from app.hardware_events import (
     EVENTOS_PERMITIDOS,
     registrar_evento,
     registrar_notificacion
 )
+from app.reservation_context import obtener_reserva_en_hora
 
 
-load_dotenv()
+logger = logging.getLogger("LabMonitor-HardwareEvents")
 
 ZONA_LOCAL = ZoneInfo("America/Mexico_City")
+
+NOMBRES_EVENTOS = {
+    "SYSTEM_SHUTDOWN": "Sistema apagado",
+    "SYSTEM_START": "Sistema iniciado",
+    "HARDWARE_CHANGED": "Hardware modificado",
+    "HARDWARE_REMOVED": "Hardware retirado",
+    "HARDWARE_ADDED": "Hardware agregado",
+    "DEVICE_DISCONNECTED": "Dispositivo desconectado",
+    "DEVICE_CONNECTED": "Dispositivo conectado"
+}
+
+NOMBRES_COMPONENTES = {
+    "cpu": "Procesador",
+    "motherboard": "Tarjeta madre",
+    "ram": "Memoria RAM",
+    "gpu": "Tarjeta gráfica",
+    "storage": "Almacenamiento",
+    "mouse": "Mouse",
+    "keyboard": "Teclado",
+    "network": "Adaptador de red"
+}
 
 router = APIRouter(
     prefix="/agent",
@@ -50,21 +73,48 @@ class LoteEventos(BaseModel):
 
 
 def obtener_destinatarios():
-    configuracion = os.getenv(
-        "ADMIN_ALERT_EMAILS",
-        "sistemas@aguascalientes.uad.mx"
-    )
+    return obtener_correos_administradores()
 
-    return list(dict.fromkeys(
-        correo.strip().lower()
-        for correo in configuracion.split(",")
-        if correo.strip()
-    ))
+
+def obtener_sesion_estudiante_en_fecha(
+    connection,
+    computer_id,
+    fecha_evento
+):
+    fecha_utc = fecha_evento.astimezone(timezone.utc).replace(
+        tzinfo=None
+    )
+    return connection.execute(
+        text("""
+            SELECT TOP 1
+                s.id AS session_id,
+                u.id AS user_id,
+                u.full_name,
+                u.student_id
+            FROM dbo.sessions AS s
+            INNER JOIN dbo.users AS u
+                ON u.id = s.user_id
+            WHERE s.computer_id = :computer_id
+              AND u.role = 'student'
+              AND s.login_at <= :event_at
+              AND (
+                    s.logout_at IS NULL
+                    OR s.logout_at >= :event_at
+              )
+            ORDER BY s.login_at DESC, s.id DESC
+        """),
+        {
+            "computer_id": computer_id,
+            "event_at": fecha_utc
+        }
+    ).mappings().first()
 
 
 def construir_notificacion(
     computadora,
-    evento
+    evento,
+    estudiante=None,
+    reserva=None
 ):
     nombre = (
         computadora.get("friendly_name")
@@ -98,10 +148,13 @@ LABORATORIO:
 {laboratorio}
 
 EVENTO:
-{evento.event_type}
+{NOMBRES_EVENTOS.get(evento.event_type, evento.event_type)}
 
 TIPO DE COMPONENTE:
-{evento.component_type}
+{NOMBRES_COMPONENTES.get(
+        evento.component_type,
+        evento.component_type
+    )}
 
 IDENTIFICADOR:
 {evento.hardware_identifier}
@@ -116,7 +169,19 @@ FECHA Y HORA (AGUASCALIENTES):
 {fecha_local}
 
 ESTUDIANTE:
-Sin sesión identificada
+{estudiante["full_name"] if estudiante else "Sin sesión identificada"}
+
+MATRÍCULA:
+{estudiante.get("student_id") or "No disponible" if estudiante else "No disponible"}
+
+DOCENTE CON RESERVA:
+{reserva["teacher_name"] if reserva else "No estaba reservado a esa hora"}
+
+MATRÍCULA DEL DOCENTE:
+{reserva.get("teacher_matricula") or "No disponible" if reserva else "No disponible"}
+
+MATERIA:
+{reserva.get("subject") or "No disponible" if reserva else "No disponible"}
 
 IDENTIFICADOR DEL EVENTO:
 {evento.event_uuid}
@@ -167,6 +232,11 @@ def sincronizar_eventos(
             )
 
     destinatarios = obtener_destinatarios()
+    if not destinatarios:
+        logger.error(
+            "No se configuraron destinatarios para alertas "
+            "de hardware; los eventos no generarán correos."
+        )
 
     with engine.begin() as connection:
 
@@ -203,6 +273,12 @@ def sincronizar_eventos(
 
             if existente:
                 if existente[0] != computer_id:
+                    logger.error(
+                        "Evento de hardware duplicado de otra "
+                        "computadora: origen %s, destino %s",
+                        existente[0],
+                        computer_id
+                    )
                     raise HTTPException(
                         status_code=409,
                         detail="UUID asociado a otra computadora"
@@ -229,28 +305,109 @@ def sincronizar_eventos(
             ).first()
 
             if componente is None:
-                raise HTTPException(
-                    status_code=409,
-                    detail=(
-                        "Componente no registrado: "
-                        + evento.hardware_identifier
+                estados_transicion = {
+                    "DEVICE_DISCONNECTED": "removed",
+                    "HARDWARE_REMOVED": "removed",
+                    "DEVICE_CONNECTED": "active",
+                    "HARDWARE_ADDED": "active"
+                }
+                estado = estados_transicion.get(evento.event_type)
+
+                if estado is None:
+                    logger.error(
+                        "Evento de hardware sin componente registrado: "
+                        "computadora %s, tipo %s, evento %s",
+                        computer_id,
+                        evento.component_type,
+                        evento.event_type
                     )
+                    raise HTTPException(
+                        status_code=409,
+                        detail=(
+                            "Componente no registrado: "
+                            + evento.hardware_identifier
+                        )
+                    )
+
+                componente = connection.execute(
+                    text("""
+                        INSERT INTO dbo.hardware_components (
+                            computer_id,
+                            component_type,
+                            manufacturer,
+                            model,
+                            serial_number,
+                            hardware_identifier,
+                            status,
+                            first_seen,
+                            last_seen
+                        )
+                        OUTPUT INSERTED.id
+                        VALUES (
+                            :computer_id,
+                            :component_type,
+                            NULL,
+                            NULL,
+                            NULL,
+                            :hardware_identifier,
+                            :status,
+                            SYSUTCDATETIME(),
+                            SYSUTCDATETIME()
+                        )
+                    """),
+                    {
+                        "computer_id": computer_id,
+                        "component_type": evento.component_type,
+                        "hardware_identifier":
+                            evento.hardware_identifier,
+                        "status": estado
+                    }
+                ).scalar_one()
+                logger.warning(
+                    "Componente faltante registrado desde evento "
+                    "de transición: computadora %s, tipo %s, "
+                    "evento %s, estado %s",
+                    computer_id,
+                    evento.component_type,
+                    evento.event_type,
+                    estado
                 )
+            else:
+                componente = componente[0]
+
+            estudiante = obtener_sesion_estudiante_en_fecha(
+                connection,
+                computer_id,
+                evento.detected_at
+            )
+            reserva = obtener_reserva_en_hora(
+                connection,
+                computadora.get("laboratory_id"),
+                evento.detected_at
+            )
 
             event_id = registrar_evento(
                 connection=connection,
                 computer_id=computer_id,
-                component_id=componente[0],
+                component_id=componente,
                 event_type=evento.event_type,
                 previous_value=evento.previous_value,
                 new_value=evento.new_value,
+                session_id=(
+                    estudiante["session_id"]
+                    if estudiante else None
+                ),
+                user_id=estudiante["user_id"] if estudiante else None,
                 event_uuid=uuid_texto,
-                detected_at=evento.detected_at
+                detected_at=evento.detected_at,
+                reservation=reserva
             )
 
             asunto, mensaje = construir_notificacion(
                 computadora,
-                evento
+                evento,
+                estudiante,
+                reserva
             )
 
             for destinatario in destinatarios:

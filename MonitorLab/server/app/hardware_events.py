@@ -26,7 +26,8 @@ def registrar_evento(
     session_id=None,
     user_id=None,
     event_uuid=None,
-    detected_at=None
+    detected_at=None,
+    reservation=None
 ):
     """
     Registra eventos de hardware en SQL Server.
@@ -76,7 +77,13 @@ def registrar_evento(
                 detected_at,
                 session_id,
                 user_id,
-                event_uuid
+                event_uuid,
+                reservation_id,
+                reserved_teacher_user_id,
+                reserved_teacher_name,
+                reserved_teacher_matricula,
+                reservation_subject,
+                reservation_was_active
             )
             OUTPUT INSERTED.id
             VALUES (
@@ -88,7 +95,13 @@ def registrar_evento(
                 :detected_at,
                 :session_id,
                 :user_id,
-                :event_uuid
+                :event_uuid,
+                :reservation_id,
+                :reserved_teacher_user_id,
+                :reserved_teacher_name,
+                :reserved_teacher_matricula,
+                :reservation_subject,
+                :reservation_was_active
             )
         """),
         {
@@ -100,7 +113,23 @@ def registrar_evento(
             "detected_at": fecha_sql,
             "session_id": session_id,
             "user_id": user_id,
-            "event_uuid": event_uuid
+            "event_uuid": event_uuid,
+            "reservation_id": (
+                reservation["reservation_id"] if reservation else None
+            ),
+            "reserved_teacher_user_id": (
+                reservation["teacher_user_id"] if reservation else None
+            ),
+            "reserved_teacher_name": (
+                reservation["teacher_name"] if reservation else None
+            ),
+            "reserved_teacher_matricula": (
+                reservation["teacher_matricula"] if reservation else None
+            ),
+            "reservation_subject": (
+                reservation["subject"] if reservation else None
+            ),
+            "reservation_was_active": reservation is not None
         }
     )
 

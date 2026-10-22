@@ -13,7 +13,12 @@ from sqlalchemy.exc import IntegrityError
 
 from app.agent_auth import autenticar_agente
 from app.database import engine
-from app.security import SECRET_KEY, ALGORITHM
+from app.security import (
+    SECRET_KEY,
+    ALGORITHM,
+    EXPIRE_MINUTES,
+    crear_token
+)
 
 
 # ==========================================
@@ -34,10 +39,18 @@ class FinalizarSesionRequest(BaseModel):
     session_id: int = Field(gt=0)
 
 
+class RegistrarActividadRequest(BaseModel):
+    session_id: int = Field(gt=0)
+
+
 class RecuperarSesionRequest(BaseModel):
     session_id: int = Field(gt=0)
     action: str = Field(
         pattern="^(check|close)$"
+    )
+    reason: str | None = Field(
+        default=None,
+        pattern="^pending_close$"
     )
 
 
@@ -139,7 +152,8 @@ def iniciar_sesion(
                         user_id,
                         computer_id,
                         login_at,
-                        logout_at
+                        logout_at,
+                        last_activity_at
                     )
                     OUTPUT
                         INSERTED.id,
@@ -148,7 +162,8 @@ def iniciar_sesion(
                         :user_id,
                         :computer_id,
                         SYSUTCDATETIME(),
-                        NULL
+                        NULL,
+                        SYSUTCDATETIME()
                     )
                 """),
                 {
@@ -241,10 +256,12 @@ def finalizar_sesion(
         sesion = connection.execute(
             text("""
                 UPDATE dbo.sessions
-                SET logout_at = SYSUTCDATETIME()
+                SET logout_at = SYSUTCDATETIME(),
+                    close_reason = 'manual'
                 OUTPUT
                     INSERTED.id,
-                    INSERTED.logout_at
+                    INSERTED.logout_at,
+                    INSERTED.close_reason
                 WHERE id = :session_id
                   AND user_id = :user_id
                   AND computer_id = :computer_id
@@ -269,7 +286,54 @@ def finalizar_sesion(
     return {
         "message": "Sesión finalizada correctamente",
         "session_id": sesion["id"],
-        "logout_at": fecha_iso(sesion["logout_at"])
+        "logout_at": fecha_iso(sesion["logout_at"]),
+        "close_reason": sesion["close_reason"]
+    }
+
+
+# ==========================================
+# REGISTRAR ACTIVIDAD INTERACTIVA
+# ==========================================
+
+@router.post("/activity")
+def registrar_actividad(
+    datos: RegistrarActividadRequest,
+    estudiante: dict = Depends(autenticar_estudiante),
+    agente: dict = Depends(autenticar_agente)
+):
+    with engine.begin() as connection:
+        sesion = connection.execute(
+            text("""
+                UPDATE dbo.sessions
+                SET last_activity_at = SYSUTCDATETIME()
+                OUTPUT
+                    INSERTED.id,
+                    INSERTED.last_activity_at
+                WHERE id = :session_id
+                  AND user_id = :user_id
+                  AND computer_id = :computer_id
+                  AND logout_at IS NULL
+            """),
+            {
+                "session_id": datos.session_id,
+                "user_id": estudiante["id"],
+                "computer_id": agente["computer_id"]
+            }
+        ).mappings().first()
+
+    if sesion is None:
+        raise HTTPException(
+            status_code=409,
+            detail="La sesión ya no está activa en esta computadora"
+        )
+
+    return {
+        "session_id": sesion["id"],
+        "last_activity_at": fecha_iso(
+            sesion["last_activity_at"]
+        ),
+        "access_token": crear_token(estudiante["id"]),
+        "expires_in": EXPIRE_MINUTES * 60
     }
 
 
@@ -305,6 +369,8 @@ def recuperar_sesion(
                     user_id,
                     computer_id,
                     login_at,
+                    last_activity_at,
+                    close_reason,
                     logout_at
                 FROM dbo.sessions
                 WHERE id = :session_id
@@ -332,8 +398,21 @@ def recuperar_sesion(
                 "computer_id": sesion["computer_id"],
                 "active": sesion["logout_at"] is None,
                 "login_at": fecha_iso(sesion["login_at"]),
-                "logout_at": fecha_iso(sesion["logout_at"])
+                "logout_at": fecha_iso(sesion["logout_at"]),
+                "last_activity_at": fecha_iso(
+                    sesion["last_activity_at"]
+                ),
+                "close_reason": sesion["close_reason"]
             }
+
+        if datos.reason != "pending_close":
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "El cierre de recuperación requiere una "
+                    "intención local pending_close."
+                )
+            )
 
         # Cierre idempotente:
         # si ya estaba cerrada, devolvemos su
@@ -344,16 +423,19 @@ def recuperar_sesion(
                 "message": "La sesión ya estaba cerrada",
                 "session_id": sesion["id"],
                 "active": False,
-                "logout_at": fecha_iso(sesion["logout_at"])
+                "logout_at": fecha_iso(sesion["logout_at"]),
+                "close_reason": sesion["close_reason"]
             }
 
         cierre = connection.execute(
             text("""
                 UPDATE dbo.sessions
-                SET logout_at = SYSUTCDATETIME()
+                SET logout_at = SYSUTCDATETIME(),
+                    close_reason = 'pending_close'
                 OUTPUT
                     INSERTED.id,
-                    INSERTED.logout_at
+                    INSERTED.logout_at,
+                    INSERTED.close_reason
                 WHERE id = :session_id
                   AND computer_id = :computer_id
                   AND logout_at IS NULL
@@ -369,7 +451,7 @@ def recuperar_sesion(
             # simultáneamente. Consultamos el estado.
             actual = connection.execute(
                 text("""
-                    SELECT logout_at
+                    SELECT logout_at, close_reason
                     FROM dbo.sessions
                     WHERE id = :session_id
                       AND computer_id = :computer_id
@@ -387,13 +469,16 @@ def recuperar_sesion(
                 )
 
             fecha_cierre = actual["logout_at"]
+            motivo_cierre = actual["close_reason"]
 
         else:
             fecha_cierre = cierre["logout_at"]
+            motivo_cierre = cierre["close_reason"]
 
     return {
         "message": "Sesión recuperada y finalizada",
         "session_id": datos.session_id,
         "active": False,
-        "logout_at": fecha_iso(fecha_cierre)
+        "logout_at": fecha_iso(fecha_cierre),
+        "close_reason": motivo_cierre
     }
